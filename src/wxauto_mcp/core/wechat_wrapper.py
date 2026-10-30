@@ -12,23 +12,48 @@ from functools import wraps
 from threading import Lock, RLock
 from pathlib import Path
 
-# 导入 wxautox4
+# 导入 wxautox4 (Windows) 或 wxauto_linux (Linux 原生驱动)
 try:
     from wxautox4 import WeChat as WXWeChat
     from wxautox4.utils.useful import authenticate, check_license
     from wxautox4.msgs import BaseMessage
     from wxautox4 import Chat
     WXAUTO_AVAILABLE = True
+    USING_LINUX_DRIVER = False
 except ImportError:
-    WXAUTO_AVAILABLE = False
-    WXWeChat = None
+    try:
+        # Linux: 微信 Linux 客户端原生驱动 (KWin + wdotool/libei + OCR)
+        from wxauto_linux import WeChat as WXWeChat
+        from wxauto_linux import authenticate, check_license
+        from wxauto_linux import Chat
+        BaseMessage = object
+        WXAUTO_AVAILABLE = True
+        USING_LINUX_DRIVER = True
+    except ImportError:
+        WXAUTO_AVAILABLE = False
+        WXWeChat = None
+        USING_LINUX_DRIVER = False
 
 # 导入本地模型
 from .models import (
     MessageResult, ContactInfo, SessionInfo, MessageInfo,
     WeChatStatus, ListenConfig, MessageType, MessageAttribute,
-    ChatType, SendStatus
+    ChatType, SendStatus,
 )
+
+
+def _to_enum(enum_cls, value, default):
+    """把底层驱动的 type/attr 字符串解析为枚举 (兼容成员名与枚举值两种写法)。"""
+    if isinstance(value, enum_cls):
+        return value
+    s = str(value) if value is not None else ''
+    try:
+        return enum_cls(s)
+    except ValueError:
+        try:
+            return enum_cls[s.upper()]
+        except (KeyError, ValueError):
+            return default
 
 
 # 配置日志
@@ -461,8 +486,8 @@ class WeChatWrapper:
                 result.append(MessageInfo(
                     content=msg.content,
                     sender=msg.sender,
-                    msg_type=MessageType(msg.type) if msg.type in MessageType.__members__ else MessageType.TEXT,
-                    attr=MessageAttribute(msg.attr) if msg.attr in MessageAttribute.__members__ else MessageAttribute.FRIEND,
+                    msg_type=_to_enum(MessageType, getattr(msg, 'type', ''), MessageType.TEXT),
+                    attr=_to_enum(MessageAttribute, getattr(msg, 'attr', 'friend'), MessageAttribute.FRIEND),
                     chat_name=msg.chat.get("name") if hasattr(msg, 'chat') else None
                 ))
             return result
@@ -488,8 +513,8 @@ class WeChatWrapper:
                 result.append(MessageInfo(
                     content=msg.content,
                     sender=msg.sender,
-                    msg_type=MessageType(msg.type) if msg.type in MessageType.__members__ else MessageType.TEXT,
-                    attr=MessageAttribute(msg.attr) if msg.attr in MessageAttribute.__members__ else MessageAttribute.FRIEND
+                    msg_type=_to_enum(MessageType, getattr(msg, 'type', ''), MessageType.TEXT),
+                    attr=_to_enum(MessageAttribute, getattr(msg, 'attr', 'friend'), MessageAttribute.FRIEND)
                 ))
             return result
         except Exception as e:

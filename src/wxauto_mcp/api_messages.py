@@ -21,7 +21,7 @@ try:
         sys.path.insert(0, str(project_root))
 
     from wxauto_mcp.core.wechat_wrapper import get_wechat
-    from wxauto_mcp.core.models import MessageInfo, MessageType
+    from wxauto_mcp.core.models import MessageInfo, MessageType, MessageAttribute
 
     WECHAT_AVAILABLE = True
 except ImportError as e:
@@ -113,7 +113,8 @@ def get_messages() -> str:
                 "sender": msg.sender,
                 "content": truncate_text(msg.content, 200),
                 "type": msg.msg_type.value if isinstance(msg.msg_type, MessageType) else str(msg.msg_type),
-                "attr": msg.attr.value if isinstance(msg.attr, MessageType) else str(msg.attr),
+                "attr": msg.attr.value if isinstance(msg.attr, MessageAttribute) else str(msg.attr),
+                "chat_name": msg.chat_name,
             })
 
         result = {

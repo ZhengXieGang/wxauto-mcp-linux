@@ -1,87 +1,16 @@
-# Byte-compiled / optimized / DLL files
+# Python
 __pycache__/
 *.py[cod]
-*$py.class
-
-# C extensions
-*.so
-
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-pip-wheel-metadata/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-
-# PyInstaller
-*.manifest
-*.spec
-
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py,cover
-.hypothesis/
-.pytest_cache/
-
-# Environments
-.env
-.venv
-env/
+.venv/
 venv/
-ENV/
-env.bak/
-venv.bak/
 
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# Project specific
+# 运行时/本地
+tmp/
+*.png
 *.log
-wxauto_logs/
-mcp-configs/
-playwright-report/
-.playwright-mcp/
+wdotool-bin/
 
-# OS
+# IDE/系统
+.idea/
+.vscode/
 .DS_Store
-Thumbs.db
-
-# Test files
-test_*.py
-listen_*.py
-send_*.py
-
-# Temporary files
-*.tmp
-*.bak
-*.orig
-
-# other
-.claude/
-*.ignore

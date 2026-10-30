@@ -1,0 +1,152 @@
+"""窗口管理: KWin D-Bus 脚本查询/激活微信窗口 (逻辑坐标系)。"""
+import json
+import os
+import re
+import subprocess
+import time
+
+ANSI = re.compile(r'\x1b\[[0-9;]*m')
+
+GEO_JS = (
+    'const w = (() => { for (const x of workspace.windowList()) '
+    'if (x.resourceClass == "wechat" && x.caption.indexOf("微信") >= 0) return x; })();'
+    'if (w) { const g = w.frameGeometry; '
+    'console.info("WXGEO|" + Math.round(g.x) + "|" + Math.round(g.y) + "|" '
+    '+ Math.round(g.width) + "|" + Math.round(g.height)); '
+    '} else { console.info("WXGEO|none"); }'
+)
+
+ACTIVATE_JS = (
+    'const w = (() => { for (const x of workspace.windowList()) '
+    'if (x.resourceClass == "wechat" && x.caption.indexOf("微信") >= 0) return x; })();'
+    'if (w) { try { workspace.activeWindow = w; } catch (e) {} '
+    'try { if (w.activate) w.activate(); } catch (e2) {} }'
+)
+
+
+def session_env():
+    """完整图形会话环境: MCP 宿主会过滤 WAYLAND_DISPLAY/DBUS 等变量, 这里推断补齐。"""
+    import glob
+    e = dict(os.environ)
+    xrd = e.get('XDG_RUNTIME_DIR') or f'/run/user/{os.getuid()}'
+    e.setdefault('XDG_RUNTIME_DIR', xrd)
+    e.setdefault('DBUS_SESSION_BUS_ADDRESS', f'unix:path={xrd}/bus')
+    if not e.get('WAYLAND_DISPLAY') and not e.get('DISPLAY'):
+        cands = sorted(glob.glob(f'{xrd}/wayland-*'))
+        e['WAYLAND_DISPLAY'] = cands[0].rsplit('/', 1)[-1] if cands else 'wayland-0'
+    e.setdefault('XDG_CURRENT_DESKTOP', 'KDE')
+    return e
+
+
+def _env():
+    return session_env()
+
+
+def kwin_run_js(js: str, tag: str, wait=0.5):
+    """运行一段 KWin 脚本并从 journal 抓取 tag| 开头的输出。"""
+    import tempfile
+    tf = tempfile.NamedTemporaryFile(mode='w', suffix='.js', delete=False)
+    tf.write(js)
+    tf.close()
+    # loadScript 空 pluginName 会返回 -1, 必须用显式唯一名字
+    pname = f'wxa{tag}{int(time.time()*1000) % 1000000}'
+    r = subprocess.run(['qdbus', 'org.kde.KWin', '/Scripting',
+                        'org.kde.kwin.Scripting.loadScript', tf.name, pname],
+                       capture_output=True, text=True, env=_env(), timeout=10)
+    sid = (r.stdout or '').strip()
+    if not sid.isdigit():
+        try:
+            import os
+            os.unlink(tf.name)
+        except Exception:
+            pass
+        return None
+    time.sleep(0.15)
+    subprocess.run(['qdbus', 'org.kde.KWin', f'/Scripting/Script{sid}',
+                    'org.kde.kwin.Script.run'], capture_output=True, env=_env(), timeout=10)
+    # 脚本队列偶发卡住, start() 冲刷队列
+    subprocess.run(['qdbus', 'org.kde.KWin', '/Scripting',
+                    'org.kde.kwin.Scripting.start'], capture_output=True, env=_env(), timeout=10)
+    time.sleep(wait)
+    # 先读 journal 再 stop/unload: stop 会丢弃尚未落盘的 console 输出
+    out = subprocess.run(['journalctl', '--user', '--since', '20 seconds ago',
+                          '--no-pager'], capture_output=True, text=True,
+                         env=_env(), timeout=10).stdout
+    try:
+        subprocess.run(['qdbus', 'org.kde.KWin', f'/Scripting/Script{sid}',
+                        'org.kde.kwin.Script.stop'], capture_output=True, env=_env(), timeout=5)
+    except Exception:
+        pass
+    try:
+        subprocess.run(['qdbus', 'org.kde.KWin', '/Scripting',
+                        'org.kde.kwin.Scripting.unloadScript', pname],
+                       capture_output=True, env=_env(), timeout=5)
+    except Exception:
+        pass
+    lines = [l for l in out.splitlines() if f'{tag}|' in l]
+    try:
+        import os
+        os.unlink(tf.name)
+    except Exception:
+        pass
+    if not lines:
+        return None
+    return lines[-1].split(f'{tag}|', 1)[1]
+
+
+def desktop_logical_size():
+    r = subprocess.run(['kscreen-doctor', '-o'], capture_output=True, text=True,
+                       env=_env(), timeout=10)
+    clean = ANSI.sub('', r.stdout)
+    geoms = re.findall(r'Geometry:\s*(\d+),(\d+)\s+(\d+)x(\d+)', clean)
+    w = max(int(g[0]) + int(g[2]) for g in geoms)
+    h = max(int(g[1]) + int(g[3]) for g in geoms)
+    scale = 1.0
+    m = re.search(r'Scale:\s*' + r'\x1b\[0m' + r'([\d.]+)', clean)
+    scales = re.findall(r'Scale:\s*(?:\x1b\[0m)?([\d.]+)', clean)
+    if scales:
+        scale = float(scales[0])
+    return {'w': w, 'h': h, 'scale': scale}
+
+
+def get_wechat_geometry() -> dict | None:
+    out = kwin_run_js(GEO_JS, 'WXGEO')
+    if not out or out == 'none':
+        return None
+    parts = out.split('|')
+    return {'x': float(parts[0]), 'y': float(parts[1]),
+            'w': float(parts[2]), 'h': float(parts[3])}
+
+
+def activate_wechat() -> bool:
+    kwin_run_js(ACTIVATE_JS, 'WXACT', wait=0.4)
+    return True
+
+
+def restore_wechat_from_tray() -> bool:
+    """微信窗口被关闭到托盘时, 通过 StatusNotifierItem Activate 恢复。"""
+    try:
+        r = subprocess.run(['busctl', '--user', 'list'], capture_output=True,
+                           text=True, env=_env(), timeout=10)
+        names = set(re.findall(r'org\.kde\.StatusNotifierItem-\d+-\d+', r.stdout or ''))
+    except Exception:
+        return False
+    for name in sorted(names):
+        try:
+            rid = subprocess.run(['qdbus', name, '/StatusNotifierItem',
+                                  'org.kde.StatusNotifierItem.Id'],
+                                 capture_output=True, text=True, env=_env(),
+                                 timeout=5).stdout.strip()
+        except Exception:
+            continue
+        if rid != 'wechat':
+            continue
+        try:
+            subprocess.run(['qdbus', name, '/StatusNotifierItem',
+                            'org.kde.StatusNotifierItem.Activate', '0', '0'],
+                           capture_output=True, env=_env(), timeout=5)
+            time.sleep(1.2)
+            return get_wechat_geometry() is not None
+        except Exception:
+            continue
+    return False

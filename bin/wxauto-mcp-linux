@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# wxauto-mcp Linux 版启动器 (内置 wxauto_linux 原生驱动)
+# 与放置位置无关: 相对本脚本定位项目根
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+
+export PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+export WXAUTO_LINUX_DRIVER=1
+exec "$ROOT/venv/bin/python" -c "
+import sys
+from wxauto_mcp.server import main_sync
+sys.exit(main_sync())
+" "$@"
