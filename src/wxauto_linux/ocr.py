@@ -15,21 +15,36 @@ def full_screenshot(path=None):
     path = path or tempfile.mktemp(prefix='wxshot_', suffix='.png', dir='/tmp')
     subprocess.run(['spectacle', '-b', '-n', '-o', path], timeout=25,
                    capture_output=True, env=winman.session_env())
-    for _ in range(30):
-        if os.path.exists(path) and os.path.getsize(path) > 1000:
-            time.sleep(0.9)   # spectacle 异步写盘, 等待完成
-            return path
-        time.sleep(0.1)
-    raise RuntimeError('截图失败')
+    # spectacle 异步写盘: 等文件大小连续两次采样稳定即认为写完
+    # (旧版固定 sleep(0.9), 每张截图白等 ~0.6s)
+    last = -1
+    ok = False
+    for _ in range(40):
+        try:
+            sz = os.path.getsize(path)
+        except OSError:
+            sz = -1
+        if sz > 1000 and sz == last:
+            ok = True
+            break
+        last = sz
+        time.sleep(0.12)
+    if not ok:
+        raise RuntimeError('截图失败')
+    return path
 
 
-def window_shot(wait_activate=True, shrink=0):
-    """返回微信窗口区域的 PIL Image (物理像素)。"""
+def window_shot(wait_activate=True, shrink=0, geo=None):
+    """返回微信窗口区域的 PIL Image (物理像素)。
+
+    geo: 已知的窗口几何 (避免重复查询 KWin); 传 None 则自查。
+    """
     from PIL import Image
     if wait_activate:
         winman.activate_wechat()
         time.sleep(0.35)
-    geo = winman.get_wechat_geometry()
+    if geo is None:
+        geo = winman.get_wechat_geometry()
     if geo is None:
         raise RuntimeError('未找到微信窗口')
     scale = winman.desktop_logical_size().get('scale', 1.0)
@@ -54,7 +69,6 @@ def window_shot(wait_activate=True, shrink=0):
 def ocr(image, lang='chi_sim', psm=3, tsv=True) -> list[dict]:
     """OCR 返回 [{text, x, y, w, h, conf}] (图像内坐标)。psm3 (自动版面) 比 psm6
     对深色 UI 上的浅色占位文字 (如搜索框「搜索」) 稳定得多。"""
-    from PIL import Image
     with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
         image.save(f.name)
         src = f.name

@@ -80,12 +80,17 @@ class MessageResult:
 
     @classmethod
     def from_error(cls, error: str, status: SendStatus = SendStatus.ERROR) -> "MessageResult":
-        """创建错误结果"""
+        """创建错误结果。
+
+        message 直接携带具体原因: 旧版固定为「操作失败」, 真正原因藏在
+        error 字段里且被 API 层丢弃, 调用方完全无法排查。
+        """
+        detail = (error or "").strip() or "操作失败"
         return cls(
             success=False,
             status=status,
-            message="操作失败",
-            error=error
+            message=detail,
+            error=detail
         )
 
 

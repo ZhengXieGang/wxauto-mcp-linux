@@ -324,8 +324,12 @@ async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[TextCon
 
     try:
         logger.info(f"[MCP] 执行工具函数: {name}")
-        # 调用工具函数
-        result = func(**arguments)
+        # 在工作线程执行: 工具函数是阻塞式 (OCR/点击, 可达十几秒),
+        # 直接在事件循环里跑会把整个 MCP 服务器卡死, 后续调用全部排队超时
+        import asyncio
+        import functools
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, functools.partial(func, **arguments))
 
         logger.info(f"[MCP] 工具执行完成: {name}, 结果长度: {len(str(result))}")
 

@@ -56,6 +56,14 @@ def _to_enum(enum_cls, value, default):
             return default
 
 
+def _name_similar(a: str, b: str) -> bool:
+    """OCR 噪声容忍的名称模糊匹配 (字符集重合率 ≥ 0.7)。"""
+    sa, sb = set(a or ''), set(b or '')
+    if not sa or not sb:
+        return False
+    return len(sa & sb) / max(len(sa), len(sb)) >= 0.7
+
+
 # 配置日志
 logger = logging.getLogger(__name__)
 
@@ -321,22 +329,38 @@ class WeChatWrapper:
         """
         try:
             with self._wx_lock:
-                self.wx.ChatWith(who=who, exact=exact)
+                response = self.wx.ChatWith(who=who, exact=exact)
 
-                # 验证切换是否成功
+                # Linux 驱动的 ChatWith 返回 WxResponse 且已自带点击后验证,
+                # 直接以它为准; 旧版在这里用 chat_name == who 精确比对,
+                # OCR 读出的名称带一点噪声 ('"文件传输助手') 就误报失败
+                if hasattr(response, 'success') and response.success is not None:
+                    if not response.success:
+                        return MessageResult.from_error(
+                            response.message or "切换失败",
+                            SendStatus.FAILED
+                        )
+                    info = self.wx.ChatInfo()
+                    return MessageResult.from_success(
+                        response.message or "切换成功",
+                        data={"chat_name": who, "chat_info": info}
+                    )
+
+                # wxautox4 路径: ChatWith 返回 None, 用名称校验 (模糊)
                 info = self.wx.ChatInfo()
-                if info.get("chat_name") == who:
+                cur = (info or {}).get("chat_name", "")
+                if cur and (cur == who or who in cur or cur in who
+                            or _name_similar(who, cur)):
                     logger.info(f"成功切换到聊天: {who}")
                     return MessageResult.from_success(
                         f"切换成功",
-                        data={"chat_name": who, "chat_info": info}
+                        data={"chat_name": cur, "chat_info": info}
                     )
-                else:
-                    logger.warning(f"切换失败: 期望 {who}，实际 {info.get('chat_name')}")
-                    return MessageResult.from_error(
-                        f"切换失败: 聊天名称不匹配",
-                        SendStatus.FAILED
-                    )
+                logger.warning(f"切换失败: 期望 {who}，实际 {cur}")
+                return MessageResult.from_error(
+                    f"切换失败: 期望 {who!r}, 当前 {cur!r}",
+                    SendStatus.FAILED
+                )
         except Exception as e:
             logger.error(f"切换聊天失败: {e}")
             return MessageResult.from_error(f"切换聊天失败: {e}")
@@ -353,7 +377,7 @@ class WeChatWrapper:
             return self.wx.ChatInfo()
         except Exception as e:
             logger.error(f"获取聊天信息失败: {e}")
-            return {}
+            raise
 
     @require_online
     @retry_on_failure(max_retries=2, delay=0.5)
@@ -469,7 +493,7 @@ class WeChatWrapper:
             return result
         except Exception as e:
             logger.error(f"获取会话列表失败: {e}")
-            return []
+            raise
 
     @require_online
     def get_all_messages(self) -> list[MessageInfo]:
@@ -493,7 +517,7 @@ class WeChatWrapper:
             return result
         except Exception as e:
             logger.error(f"获取消息失败: {e}")
-            return []
+            raise
 
     @require_online
     def get_history_messages(self, n: int = 50) -> list[MessageInfo]:
@@ -519,7 +543,7 @@ class WeChatWrapper:
             return result
         except Exception as e:
             logger.error(f"获取历史消息失败: {e}")
-            return []
+            raise
 
     @require_online
     def get_recent_groups(self) -> list[str]:
@@ -536,7 +560,7 @@ class WeChatWrapper:
             return []
         except Exception as e:
             logger.error(f"获取群聊列表失败: {e}")
-            return []
+            raise
 
     @require_online
     def get_friend_details(
@@ -575,7 +599,7 @@ class WeChatWrapper:
             return result
         except Exception as e:
             logger.error(f"获取好友列表失败: {e}")
-            return []
+            raise
 
     @require_online
     def get_sub_window(self, nickname: str):

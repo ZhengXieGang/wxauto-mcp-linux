@@ -66,6 +66,10 @@ def key_escape():
     return key('Escape')
 
 
+def key_delete():
+    return key('Delete')
+
+
 def key_ctrl_a():
     return key('ctrl+a')
 

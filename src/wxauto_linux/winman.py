@@ -23,6 +23,20 @@ ACTIVATE_JS = (
     'try { if (w.activate) w.activate(); } catch (e2) {} }'
 )
 
+# 激活 + 取几何合并为一次 D-Bus 往返 (原来两次脚本调用 ~1.8s, 现在 ~0.7s)
+ACTIVATE_GEO_JS = (
+    'const w = (() => { for (const x of workspace.windowList()) '
+    'if (x.resourceClass == "wechat" && x.caption.indexOf("微信") >= 0) return x; })();'
+    'if (!w) { console.info("WXGA|none"); } else { '
+    'let act = "n"; '
+    'try { if (workspace.activeWindow !== w) { '
+    'try { workspace.activeWindow = w; } catch (e) {} '
+    'try { if (w.activate) w.activate(); } catch (e2) {} act = "y"; } } catch (e3) {} '
+    'const g = w.frameGeometry; '
+    'console.info("WXGA|" + act + "|" + Math.round(g.x) + "|" + Math.round(g.y) + "|" '
+    '+ Math.round(g.width) + "|" + Math.round(g.height)); }'
+)
+
 
 def session_env():
     """完整图形会话环境: MCP 宿主会过滤 WAYLAND_DISPLAY/DBUS 等变量, 这里推断补齐。"""
@@ -121,6 +135,21 @@ def get_wechat_geometry() -> dict | None:
 def activate_wechat() -> bool:
     kwin_run_js(ACTIVATE_JS, 'WXACT', wait=0.4)
     return True
+
+
+def activate_and_geo() -> tuple:
+    """激活微信窗口并返回几何, 一次 D-Bus 往返。
+
+    返回 (geo, activated): activated=False 表示窗口本就在前台 (可少等一会儿)。
+    """
+    out = kwin_run_js(ACTIVATE_GEO_JS, 'WXGA', wait=0.35)
+    if not out or out == 'none':
+        return None, False
+    p = out.split('|')          # [act, x, y, w, h]
+    if len(p) < 5:
+        return get_wechat_geometry(), True
+    return ({'x': float(p[1]), 'y': float(p[2]),
+             'w': float(p[3]), 'h': float(p[4])}, p[0] == 'y')
 
 
 def restore_wechat_from_tray() -> bool:
