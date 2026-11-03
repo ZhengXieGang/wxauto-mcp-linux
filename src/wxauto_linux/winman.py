@@ -108,19 +108,37 @@ def kwin_run_js(js: str, tag: str, wait=0.5):
     return lines[-1].split(f'{tag}|', 1)[1]
 
 
-def desktop_logical_size():
+def desktop_logical_size(for_geo=None):
+    """显示器逻辑尺寸与缩放。
+
+    for_geo: 传入窗口几何时, 选择包含窗口中心的那块屏 —— 多显示器且
+    混合 DPI (如外接 1.0 + 内屏 1.5) 时, 必须用窗口所在屏的 scale,
+    否则截图裁剪坐标全部错位。无匹配时退回最大面积的屏。
+    """
     r = subprocess.run(['kscreen-doctor', '-o'], capture_output=True, text=True,
                        env=_env(), timeout=10)
     clean = ANSI.sub('', r.stdout)
-    geoms = re.findall(r'Geometry:\s*(\d+),(\d+)\s+(\d+)x(\d+)', clean)
-    w = max(int(g[0]) + int(g[2]) for g in geoms)
-    h = max(int(g[1]) + int(g[3]) for g in geoms)
-    scale = 1.0
-    m = re.search(r'Scale:\s*' + r'\x1b\[0m' + r'([\d.]+)', clean)
-    scales = re.findall(r'Scale:\s*(?:\x1b\[0m)?([\d.]+)', clean)
-    if scales:
-        scale = float(scales[0])
-    return {'w': w, 'h': h, 'scale': scale}
+    outs = []
+    for blk in re.split(r'Output:\s*\d+\s+\S+', clean)[1:]:
+        g = re.search(r'Geometry:\s*(\d+),(\d+)\s+(\d+)x(\d+)', blk)
+        s = re.search(r'Scale:\s*([\d.]+)', blk)
+        if not g:
+            continue
+        outs.append({'x': int(g.group(1)), 'y': int(g.group(2)),
+                     'w': int(g.group(3)), 'h': int(g.group(4)),
+                     'scale': float(s.group(1)) if s else 1.0})
+    if not outs:
+        return {'w': 0, 'h': 0, 'scale': 1.0}
+    pick = outs[0]
+    if for_geo is not None and len(outs) > 1:
+        cx = for_geo['x'] + for_geo['w'] / 2
+        cy = for_geo['y'] + for_geo['h'] / 2
+        for o in outs:
+            if o['x'] <= cx < o['x'] + o['w'] and o['y'] <= cy < o['y'] + o['h']:
+                pick = o
+                break
+    return {'w': pick['x'] + pick['w'], 'h': pick['y'] + pick['h'],
+            'scale': pick['scale']}
 
 
 def get_wechat_geometry() -> dict | None:

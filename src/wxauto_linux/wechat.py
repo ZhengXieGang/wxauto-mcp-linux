@@ -80,12 +80,23 @@ def _clean_name(s: str) -> str:
 # 标题行上的单字图标幻觉 (len==1 且在黑名单 → 丢弃)
 _TITLE_NOISE = {'—', '一', '。', '·', '口', '口区', '回', '×', '区', '全',
                 '日', '吗', 'Q', 'X', 'L', 'O', '曲', '”', '"', '|', '/', '\\',
-                '口。', '”全'}
+                '+', '口。', '”全'}
 
-# 左侧导航栏图标位置 (窗口相对比例; 实测聊天 ~0.21H, 联系人 ~0.30H)
-NAV_X = 0.035
-NAV_CHAT_Y = 0.21
-NAV_CONTACT_Y = 0.30
+# ---- UI 骨架固定逻辑坐标 --------------------------------------------
+# 实测 841×545 与 1707×1023 两种窗口、不同 DPI 下完全一致: 微信 Linux 的
+# 左栏/面板/输入区都是固定逻辑尺寸, 不随窗口大小或缩放拉伸。
+# 旧版按窗口比例定位 (0.21H/0.30H/0.42W...), 窗口一变 (尤其最大化) 全部漂移。
+NAV_CHAT = (30, 115)       # 左栏导航: 聊天图标中心
+NAV_CONTACT = (30, 163)    # 左栏导航: 联系人图标中心
+PANEL_X1 = 300             # 会话/联系人列表面板右缘 (固定宽, 不随窗口拉伸)
+SEARCH_FALLBACK = (100, 50, 27, 17)   # 搜索框文字兜底锚点 (lx, ly, lw, lh)
+TIME_COL_W = 62            # 会话行右侧时间列宽
+ICON_COL_W = 26            # 静音铃铛图标列宽
+AVATAR_X0, AVATAR_X1 = 55, 100          # 会话行头像列 (红点检测)
+CT_AVATAR_X0, CT_AVATAR_X1 = 68, 106    # 联系人页头像列
+INPUT_H = 145              # 底部输入区固定高 (聊天区下界 = 窗口底 - INPUT_H)
+DROPDOWN_X1 = 358          # 搜索下拉面板右缘
+DROPDOWN_H = 470           # 搜索下拉最大可视高
 
 
 def _serialized(func):
@@ -140,7 +151,8 @@ class WeChat:
         """
         try:
             geo = self._cached_geo()
-            wdt.click(geo['x'] + geo['w'] * 0.5, geo['y'] + geo['h'] * 0.88)
+            # 点输入框区域 (固定在底部, 距底 70 在输入区内, 任何窗口高度都对)
+            wdt.click(geo['x'] + geo['w'] * 0.5, geo['y'] + geo['h'] - 70)
             time.sleep(0.3)
             self._snap = None
         except Exception:
@@ -196,17 +208,38 @@ class WeChat:
         self._snap = (time.monotonic(), img, None, geo, scale)
         return img, geo, scale
 
+    @staticmethod
+    def _dedup_rows(rows):
+        """v6 偶尔对同一文本出两个偏移几个像素的检测框 —— 名称黏连
+        ('张三张三')/时间双读的根源。同视觉行内水平重叠超过较小框 55%
+        的两个框, 只留 conf 高的那个。"""
+        out = []
+        for r in sorted(rows, key=lambda r: -r.get('conf', 0)):
+            dup = False
+            for k in out:
+                ov = min(r['lx'] + r['lw'], k['lx'] + k['lw']) - max(r['lx'], k['lx'])
+                if (ov > min(r['lw'], k['lw']) * 0.55
+                        and abs(r['ly'] - k['ly']) < max(r['lh'], k['lh'])):
+                    dup = True
+                    break
+            if not dup:
+                out.append(r)
+        return out
+
     def _window_rows(self, activate=True, refresh=False, psm=3):
         """截图 + 全窗口 OCR (带缓存)。返回 (img, rows, geo, scale)。"""
         now = time.monotonic()
         if not refresh and self._snap and now - self._snap[0] < CACHE_TTL:
             _, img, rows, geo, scale = self._snap
             if rows is None:
-                rows = ocr.ocr(img, psm=psm)
+                # _shot 只存图不存行; 这里 OCR 后必须转窗口逻辑坐标 + 去重
+                # (旧版漏转换, 原始图像坐标行流进 _anchors 曾致 KeyError)
+                rows = self._dedup_rows(
+                    self._to_window_rows(ocr.ocr(img, psm=psm), geo, scale))
                 self._snap = (self._snap[0], img, rows, geo, scale)
             return img, rows, geo, scale
         img, geo, scale = self._shot(activate=activate, refresh=True)
-        rows = self._to_window_rows(ocr.ocr(img, psm=psm), geo, scale)
+        rows = self._dedup_rows(self._to_window_rows(ocr.ocr(img, psm=psm), geo, scale))
         self._snap = (time.monotonic(), img, rows, geo, scale)
         return img, rows, geo, scale
 
@@ -222,31 +255,33 @@ class WeChat:
             r['ly'] = geo['y'] + y0f * H + r['y'] / scale
             r['lw'] = r['w'] / scale
             r['lh'] = r['h'] / scale
-        return rows
+        return self._dedup_rows(rows)
 
     def _state(self, activate=True, refresh=False):
         """读一次窗口状态: (img, rows, geo, scale, anchors)。
 
-        搜索框的灰色占位字「搜索」对比度太低, 主 pass 常漏检 →
-        顶部条带灰度拉伸后再补一遍 (两遍结果合并)。
+        搜索框的灰色占位字「搜索」对比度太低主 pass 可能漏检 → 只在
+        锚点确实缺失时才补一遍顶部条带灰度拉伸 OCR (省 ~2s/次)。
         """
         img, rows, geo, scale = self._window_rows(activate=activate, refresh=refresh)
-        W, H = geo['w'], geo['h']
-        try:
-            band = img.crop((int(0.04 * W * scale), int(0.02 * H * scale),
-                             int(0.42 * W * scale), int(0.16 * H * scale)))
-            st = ocr.stretch_gray(band)
-            ox, oy = 0.04 * W, 0.02 * H
-            extra = ocr.ocr(st)
-            for r in extra:
-                r['lx'] = geo['x'] + ox + r['x'] / scale
-                r['ly'] = geo['y'] + oy + r['y'] / scale
-                r['lw'] = r['w'] / scale
-                r['lh'] = r['h'] / scale
-            rows = rows + extra
-        except Exception:
-            pass
         a = self._anchors(rows, geo, img, scale)
+        if 'search' not in a:
+            W, H = geo['w'], geo['h']
+            try:
+                band = img.crop((int(0.04 * W * scale), int(0.02 * H * scale),
+                                 int(0.42 * W * scale), int(0.16 * H * scale)))
+                st = ocr.stretch_gray(band)
+                ox, oy = 0.04 * W, 0.02 * H
+                extra = ocr.ocr(st)
+                for r in extra:
+                    r['lx'] = geo['x'] + ox + r['x'] / scale
+                    r['ly'] = geo['y'] + oy + r['y'] / scale
+                    r['lw'] = r['w'] / scale
+                    r['lh'] = r['h'] / scale
+                rows = self._dedup_rows(rows + extra)
+                a = self._anchors(rows, geo, img, scale)
+            except Exception:
+                pass
         return img, rows, geo, scale, a
 
     # ---- 基础 ----------------------------------------------------------
@@ -301,7 +336,8 @@ class WeChat:
         """
         a = {}
         for r in rows:
-            if r['text'].strip() == '搜索' and r['ly'] < geo['y'] + geo['h'] * 0.15:
+            if (r['text'].strip() == '搜索'
+                    and r['ly'] < geo['y'] + 150 and r['lx'] < geo['x'] + 220):
                 a['search'] = r
                 break
         if 'search' not in a:
@@ -312,7 +348,7 @@ class WeChat:
         if rect is not None and rect[2] > sx:
             xgate = rect[2] + 4
         else:
-            xgate = sx + geo['w'] * 0.03
+            xgate = sx + a['search']['lw'] + 12
         toks = [r for r in rows
                 if r['lx'] > xgate
                 and abs(r['ly'] - sy) < 25
@@ -344,11 +380,10 @@ class WeChat:
             return a['title_name']
         s = a.get('search')
         if s is not None and img is not None:
-            rx = (s['lx'] - geo['x']) / geo['w']
             ry = (s['ly'] - geo['y']) / geo['h']
             try:
                 strip = self._ocr_region(img, geo, scale,
-                                         max(0.0, rx + 0.20), max(0.0, ry - 0.02),
+                                         150 / geo['w'], max(0.0, ry - 6 / geo['h']),
                                          1.0, min(1.0, (ry * geo['h'] + 48) / geo['h']),
                                          psm=6)
                 # 只保留标题行 (与搜索框同行) 的词块, 排除下方的会话行
@@ -442,23 +477,6 @@ class WeChat:
         return ((first['lx'] + last['lx'] + last['lw']) / 2,
                 first['ly'] + first['lh'] / 2)
 
-    def _has_red_dot(self, img, row, geo, scale, x_range):
-        import numpy as np
-        try:
-            a = np.asarray(img.convert('RGB'))
-        except Exception:
-            return False
-        sx = winman.desktop_logical_size().get('scale', 1.0)
-        x0 = int((geo['x'] + geo['w'] * x_range[0]) * sx)
-        x1 = int((geo['x'] + geo['w'] * x_range[1]) * sx)
-        y0 = int(row['ly'] * sx)
-        y1 = int((row['ly'] + max(row['lh'], 14)) * sx)
-        region = a[max(0, y0):y1, max(0, x0):x1]
-        if region.size == 0:
-            return False
-        r, g, b = region[..., 0].astype(int), region[..., 1].astype(int), region[..., 2].astype(int)
-        return bool(((r > 190) & (g < 130) & (b < 130)).sum() > 12)
-
     # ---- 状态恢复 -------------------------------------------------------
     def _recover_main_page(self):
         """回到主界面 (聊天列表): 聚焦搜索框 → 清空关键词 → 点聊天图标。
@@ -469,13 +487,14 @@ class WeChat:
         """
         try:
             geo = self._cached_geo()
-            wdt.click(geo['x'] + geo['w'] * 0.12, geo['y'] + geo['h'] * 0.078)
+            # 搜索框是固定逻辑位置 (窗口左上角), 不随窗口尺寸变化
+            wdt.click(geo['x'] + 150, geo['y'] + 58)
             time.sleep(0.4)
             wdt.key_ctrl_a()
             time.sleep(0.12)
             wdt.key_delete()
             time.sleep(0.5)
-            wdt.click(geo['x'] + geo['w'] * NAV_X, geo['y'] + geo['h'] * NAV_CHAT_Y)
+            wdt.click(geo['x'] + NAV_CHAT[0], geo['y'] + NAV_CHAT[1])
             time.sleep(0.6)
             self._snap = None
         except Exception:
@@ -509,18 +528,18 @@ class WeChat:
         # (绿色高亮行横跨整个会话面板, 比标题位置更可靠)
         rect = self._selected_session_rect(img, geo, scale)
         if rect is not None and rect[2] > sx:
-            x1 = rect[2] - W * 0.004
+            x1 = rect[2] - 4
         elif 'title' in a:
-            x1 = a['title']['lx'] - W * 0.008
+            x1 = a['title']['lx'] - 8
         else:
-            x1 = sx + W * 0.27
-        x0 = sx - W * 0.03
+            x1 = geo['x'] + PANEL_X1
+        x0 = geo['x'] + 96     # 头像列 (55..95) 右缘: 头像上的 OCR 幻觉字不黏进名字
         y0 = sy + a['search']['lh'] * 1.8          # 搜索栏以下
         items = [r for r in rows if x0 <= r['lx'] <= x1 and r['ly'] >= y0]
         lines = self._cluster_lines(items)
-        timex0 = x1 - W * 0.065                    # 时间列起始 x
-        icontimex = x1 - W * 0.025                 # 静音铃铛图标列
-        avx0, avx1 = sx - W * 0.06, sx             # 头像列 (红点检测)
+        timex0 = x1 - TIME_COL_W                   # 时间列起始 x
+        icontimex = x1 - ICON_COL_W                # 静音铃铛图标列
+        avx0, avx1 = geo['x'] + AVATAR_X0, geo['x'] + AVATAR_X1  # 头像列 (红点检测)
         sessions = []
         cur = None
         for line in lines:
@@ -546,7 +565,11 @@ class WeChat:
                     head_time = jt
                     head_y = right[0]['ly']
                     rest = [t for t in texts if t['lx'] < timex0]
-            if head_time and rest:
+            if head_time:
+                # 时间列里所有 time 形 token 都剔除 (v6 会出重复框, 只剔
+                # 首个会把第二个时间框黏进名字)
+                rest = [t for t in texts
+                        if not (t['lx'] >= timex0 and self._looks_like_time(t['text'].strip()))]
                 nm = _clean_name(self._join([t['text'] for t in rest if t['lx'] < icontimex]))
                 m = re.search(r'\[(\d+)条\]', nm)
                 new_count = int(m.group(1)) if m else 0
@@ -616,23 +639,27 @@ class WeChat:
         r, g, b = arr[..., 0].astype(int), arr[..., 1].astype(int), arr[..., 2].astype(int)
         mask = (g > 110) & (g - r > 30) & (g - b > 30)
         Wpx = arr.shape[1]
-        # 只看左侧会话面板 (窗口宽 42% 以内): 聊天区绿色气泡也命中绿色,
-        # 不裁掉会把面板右界推到气泡上, 整个会话解析崩掉
-        panel_w = int(Wpx * 0.42)
+        # 只看左侧会话面板 (固定逻辑宽 ~315, 物理像素): 聊天区绿色气泡也命中
+        # 绿色, 旧版按窗口宽 42% 裁剪 —— 最大化窗口时气泡会越界面板把右界推崩
+        panel_w = min(int(315 * scale), Wpx)
         mask[:, panel_w:] = False
+        # 左侧 52 逻辑px 是导航栏: 聊天图标选中时也是绿色, 且与第一条
+        # 会话行 y 重叠 (首行中心 ~104, 图标 ~115) —— 不裁掉会把矩形
+        # x0 拉到 22, 后续条带裁剪全歪
+        mask[:, :int(52 * scale)] = False
         counts = mask.sum(axis=1)
         ys = np.where(counts > panel_w * 0.4)[0]
         if len(ys) == 0:
             return None
         y_med = float(np.median(ys))
-        band = mask[max(0, int(y_med) - 30):int(y_med) + 30]
-        cols = np.where(band.sum(axis=0) > 10)[0]
+        band = mask[max(0, int(y_med - 22 * scale)):int(y_med + 22 * scale)]
+        cols = np.where(band.sum(axis=0) > 6 * scale)[0]
         if len(cols) == 0:
             return None
         rect = (geo['y'] + y_med / scale,
                 geo['x'] + float(cols.min()) / scale,
                 geo['x'] + float(cols.max()) / scale)
-        if rect[2] - rect[1] < geo['w'] * 0.15:    # 退化 (太窄不可信)
+        if rect[2] - rect[1] < 150:    # 退化 (固定逻辑宽判据: 面板宽 ~240, 窗口再宽也不变)
             return None
         return rect
 
@@ -654,7 +681,7 @@ class WeChat:
         px_panel = int((x_min_logical - geo['x']) * scale)
         mask[:, :max(0, px_panel)] = False       # 排除会话面板 (选中行/图标)
         Hpx = arr.shape[0]
-        ys = np.where(mask.sum(axis=1) > 30)[0]
+        ys = np.where(mask.sum(axis=1) > 20 * scale)[0]
         segs = []
         for y in ys:
             if segs and y - segs[-1][1] <= 6:
@@ -664,12 +691,12 @@ class WeChat:
         out = []
         from PIL import Image as _I
         for y0, y1 in segs:
-            if y1 - y0 < 14:                     # 图标碎片
+            if y1 - y0 < max(12, 10 * scale):    # 图标碎片
                 continue
             band = mask[y0:y1 + 1]
             colok = band.sum(axis=0) > 2
             xs = np.where(colok)[0]
-            if len(xs) == 0 or xs.max() - xs.min() < 24:
+            if len(xs) == 0 or xs.max() - xs.min() < 16 * scale:
                 continue
             x0, x1 = int(xs.min()), int(xs.max())
             # 原样裁剪 (带边距) 走常规 det+rec: v6 对长气泡直接可读
@@ -686,7 +713,7 @@ class WeChat:
                 gray = np.asarray(img.convert('L'))
                 sub = gray[y0:y1 + 1, x0:x1 + 1]
                 dm = (sub < 115) & colok[x0:x1 + 1][None, :]
-                if int(dm.sum()) < 25:
+                if int(dm.sum()) < 15 * scale:
                     continue
                 dys, dxs = np.where(dm)
                 pad = 5
@@ -716,9 +743,8 @@ class WeChat:
         跳过头像列、排除时间列与内容预览行), 实测 3/3 稳定读出。
         """
         try:
-            W = geo['w']
             x0 = int((rect[1] + 40 - geo['x']) * scale)
-            x1 = int((rect[2] - W * 0.075 - geo['x']) * scale)
+            x1 = int((rect[2] - TIME_COL_W - geo['x']) * scale)
             y0 = int((rect[0] - geo['y'] - 24) * scale)
             y1 = int((rect[0] - geo['y'] + 3) * scale)
             strip = img.crop((max(0, x0), max(0, y0), x1, min(img.height, y1)))
@@ -737,8 +763,42 @@ class WeChat:
         return [Session(e) for e in sessions]
 
     # ---- 当前聊天 -------------------------------------------------------
-    def _current_chat(self, refresh=False):
-        """当前选中会话名: 绿色高亮行匹配; 退化用标题锚点/标题条带。"""
+    def _current_chat_fast(self, refresh=False):
+        """快速当前聊天名: 只 OCR 顶部标题条带 (~1.2s, 全窗读 ~6s)。
+
+        条带左界取 150 而不是面板右缘 300: 标题离面板右缘只有 ~13px,
+        检测器对贴裁剪边文本会整块漏检 (实测)。
+        标题是当前聊天的权威指示; 读到且匹配目标即可采信, 读不到或不匹配
+        由调用方走慢路径权威复核 —— 快路径的误判方向只会「更严格」。
+        """
+        try:
+            img, geo, scale = self._shot(activate=False, refresh=refresh)
+            strip = self._ocr_region(img, geo, scale,
+                                     150 / geo['w'], 25 / geo['h'],
+                                     1.0, 92 / geo['h'], psm=6)
+            # 只留标题行: y < 74 (聊天区首行日期分隔符在 ~77) 且无时间样文本
+            strip = [r for r in strip
+                     if r['ly'] < geo['y'] + 74
+                     and r['text'].strip() != '搜索'
+                     and not re.search(r'\d{1,2}[:：.]\d{2}', r['text'])]
+            strip.sort(key=lambda r: r['lx'])
+            name = _clean_name(self._join([t['text'] for t in strip
+                                           if self._tok_ok(t)]))
+            return name if len(name) >= 2 else ''
+        except Exception:
+            return ''
+
+    def _current_chat(self, refresh=False, skip_fast=False):
+        """当前选中会话名: 标题 (对比度高) → 绿色高亮行 → 标题条带。"""
+        if refresh:
+            self._snap = None           # 强制下一读拿新帧
+        if not skip_fast:
+            try:
+                name = self._current_chat_fast()
+            except Exception:
+                name = ''
+            if name:
+                return name
         try:
             sessions, img, rows, geo, scale, a = self._session_rows(
                 activate=False, refresh=refresh, retries=0, recover=False)
@@ -829,14 +889,20 @@ class WeChat:
         return out[0]
 
     def _dropdown_rows(self, img, geo, scale, s, psms=(3, 6)):
-        """搜索框下方下拉区域的裁剪 OCR (比全窗口 OCR 快且准)。"""
-        rx = (s['lx'] - geo['x']) / geo['w']
-        ry = (s['ly'] - geo['y']) / geo['h']
-        x0f = max(0.0, rx - 0.03)
-        x1f = min(1.0, rx + 0.30)
-        y0f = min(0.85, ry + s['lh'] / geo['h'] + 0.008)
-        y1f = 0.90
-        return self._ocr_region(img, geo, scale, x0f, y0f, x1f, y1f)
+        """搜索框下方下拉区域的裁剪 OCR (比全窗口 OCR 快且准)。
+
+        下拉面板是固定逻辑宽高; 旧版按窗口比例取到 0.9H, 最大化窗口时
+        会把下拉以外聊天区的消息读进候选。
+        """
+        x0 = max(geo['x'] + 40, s['lx'] - 20)
+        x1 = geo['x'] + DROPDOWN_X1
+        y0 = s['ly'] + s['lh'] + 4
+        y1 = min(geo['y'] + geo['h'] - INPUT_H, s['ly'] + DROPDOWN_H)
+        return self._ocr_region(img, geo, scale,
+                                max(0.0, (x0 - geo['x']) / geo['w']),
+                                max(0.0, (y0 - geo['y']) / geo['h']),
+                                min(1.0, (x1 - geo['x']) / geo['w']),
+                                min(1.0, (y1 - geo['y']) / geo['h']))
 
     @_serialized
     def ChatWith(self, who: str, exact: bool = True, force: bool = False,
@@ -856,7 +922,9 @@ class WeChat:
             # 已经在目标聊天 → 直接成功。绝不能点已选中的会话行:
             # 实测微信 Linux 里再点一次选中行会把聊天收起 (toggle)
             try:
-                cur0 = self._current_chat()
+                cur0 = self._current_chat_fast()
+                if not cur0:
+                    cur0 = self._current_chat(skip_fast=True)
             except Exception:
                 cur0 = ''
             if cur0 and self._name_match(who, cur0):
@@ -869,24 +937,18 @@ class WeChat:
                     hit = e
             if hit is not None:
                 self._snap = None
-                wdt.click(a['search']['lx'] + geo['w'] * 0.13, hit['_y'] + 5)
-                time.sleep(0.7)
-                cur = self._current_chat()
-                if cur and self._name_match(who, cur):
+                wdt.click(geo['x'] + 170, hit['_y'] + 5)   # 行中部 (面板固定宽)
+                time.sleep(1.1)
+                ok, cur = self._verify_switched(who)
+                if ok:
                     self._last_chat = who
                     return WxResponse(True, f'切换到 {who} (会话列表)')
                 self._tick()
-        # 1. 搜索: OCR 定位搜索框锚点后点击 (位置随窗口尺寸变化)
-        try:
-            img, rows, geo, scale, a = self._state(activate=False)
-        except Exception:
-            img, rows, geo, scale, a = self._state(activate=True, refresh=True)
-        if 'search' not in a:
-            self._recover_main_page()
-            img, rows, geo, scale, a = self._state(activate=True, refresh=True)
-            if 'search' not in a:
-                return WxResponse(False, '未找到搜索框 (窗口可能不在主界面/未登录)')
-        s = a['search']
+        # 1. 搜索: 搜索框是固定逻辑位置 (窗口左上, 实测两种窗口尺寸一致),
+        #    直接固定坐标点击, 免去一次全窗 OCR (~8s)
+        geo = self._cached_geo()
+        s = {'lx': geo['x'] + 94, 'ly': geo['y'] + 47, 'lw': 27, 'lh': 17,
+             'text': '搜索', 'conf': 0}
         self._snap = None
         wdt.click(s['lx'] + s['lw'] / 2, s['ly'] + s['lh'] / 2)
         time.sleep(0.6)
@@ -895,7 +957,7 @@ class WeChat:
         time.sleep(0.15)
         self._clipboard(who)
         wdt.key_ctrl_v()
-        time.sleep(1.2)
+        time.sleep(0.8)
         self._tick()
         # 3. 裁剪 OCR 下拉 (psm3+psm6 双通道); 网络搜索结果可能把联系人
         #    顶下去 → 找不到就下滚列表再找一轮
@@ -903,7 +965,7 @@ class WeChat:
         prev_lines_sig = None
         for attempt in range(3):
             # 下拉可能尚未加载完 (网络搜索段是异步拉取的) → 首轮多等一会
-            time.sleep(1.2 if attempt == 0 else 0.3)
+            time.sleep(0.6 if attempt == 0 else 0.3)
             img, geo, scale = self._shot(activate=False, refresh=True)
             cand = self._dropdown_rows(img, geo, scale, s)
             c = self._search_candidate(cand, who, exact)
@@ -922,7 +984,7 @@ class WeChat:
                 break
             prev_lines_sig = sig
             if attempt >= 1:
-                wdt.mousemove(s['lx'] + geo['w'] * 0.12, s['ly'] + geo['h'] * 0.35)
+                wdt.mousemove(geo['x'] + 180, geo['y'] + 300)
                 wdt.run(['scroll', '--', '0', '400'])
                 time.sleep(0.7)
         if best is None:
@@ -932,9 +994,8 @@ class WeChat:
         # 4. 点击后必须验证切换成功 —— 防止点击落空后消息发进别的会话 (安全关键)
         self._snap = None
         wdt.click(best[2][0], best[2][1])
-        time.sleep(0.8)
-        cur = self._current_chat()
-        ok = bool(cur) and self._name_match(who, cur)
+        time.sleep(1.1)
+        ok, cur = self._verify_switched(who)
         if not ok:
             self._recover_main_page()
             self._last_chat = None
@@ -942,32 +1003,57 @@ class WeChat:
         self._last_chat = who
         return WxResponse(True, f'切换到 {who}')
 
+    def _verify_switched(self, who):
+        """切换点击后的验证: 快读 → 短等重读 (渲染可能未完成) → 刷新全读。
+
+        返回 (ok, cur)。误判方向只会「拒真」(多等/多读), 不会「纳假」。
+        """
+        cur = self._current_chat_fast()
+        if cur and self._name_match(who, cur):
+            return True, cur
+        time.sleep(0.7)
+        cur = self._current_chat_fast(refresh=True)
+        if cur and self._name_match(who, cur):
+            return True, cur
+        cur = self._current_chat(refresh=True, skip_fast=True)
+        return bool(cur) and self._name_match(who, cur), cur
+
     def _input_point(self, activate=False):
-        """定位输入框点击点: 优先「发送」按钮上方, 退化用固定比例。"""
+        """定位输入框点击点: 优先「发送」按钮上方 (用已缓存的行), 退化用
+        输入区固定几何 (底部 140 逻辑高, 距底 60 落在文字区中间)。"""
         geo = self._cached_geo()
-        try:
-            img, rows, g2, scale = self._window_rows(activate=activate)
-        except Exception:
-            rows = []
-            g2 = geo
+        rows = self._snap[2] if (self._snap and self._snap[2] is not None) else None
         send = None
-        for r in rows:
-            if r['text'].strip() == '发送' and r['ly'] > g2['y'] + g2['h'] * 0.7:
+        for r in (rows or []):
+            if r['text'].strip() == '发送' and r['ly'] > geo['y'] + geo['h'] * 0.7:
                 send = r
                 break
         if send is not None:
-            return (send['lx'] - g2['w'] * 0.30, send['ly'] - max(send['lh'] * 2.5, 30)), g2
-        return (g2['x'] + g2['w'] * 0.6, g2['y'] + g2['h'] * 0.78), g2
+            return (send['lx'] - geo['w'] * 0.30, send['ly'] - max(send['lh'] * 2.5, 30)), geo
+        return (geo['x'] + geo['w'] * 0.55, geo['y'] + geo['h'] - 60), geo
 
     def _verify_target(self, who: str) -> WxResponse | None:
         """发送前二次验证当前聊天确实是 who; 不匹配则拒绝 (防误发)。
 
-        走缓存 (ChatWith 刚验证过的截图), 通常零开销。
+        快路径标题条带 (~0s, 命中缓存) 匹配即通过; 不匹配再走全窗权威复核。
         """
+        cur = self._current_chat_fast()
+        if cur and self._name_match(who, cur):
+            return None
         cur = self._current_chat()
         if cur and self._name_match(who, cur):
             return None
         return WxResponse(False, f'安全拦截: 当前聊天 {cur!r} ≠ {who!r}, 未发送')
+
+    def _main_page_ok(self, img, geo, scale) -> bool:
+        """轻量主界面判定: 顶部条带里能看到搜索框 (~1.7s, 全窗 OCR 的 1/5)。"""
+        try:
+            band = self._ocr_region(img, geo, scale, 0.0, 0.0,
+                                    min(1.0, 320 / geo['w']), min(1.0, 95 / geo['h']),
+                                    psm=6)
+            return any('搜索' in r['text'] for r in band)
+        except Exception:
+            return False
 
     @_serialized
     def SendMsg(self, msg: str, who: str = None, clear: bool = True,
@@ -985,10 +1071,10 @@ class WeChat:
         self._snap = None
         # 粘贴前硬校验: 窗口必须真实存在且在主界面 (防止窗口消失后盲发到别的应用)
         try:
-            img, rows, g3, scale3 = self._window_rows(activate=True, refresh=True)
+            img, g3, scale3 = self._shot(activate=True, refresh=True)
         except Exception as e:
             return WxResponse(False, f'发送中止: 微信窗口不可用 ({e})')
-        if 'search' not in self._anchors(rows, g3, img, scale3):
+        if not self._main_page_ok(img, g3, scale3):
             return WxResponse(False, '发送中止: 微信窗口不在主界面 (可能未登录或被遮挡)')
         (ix, iy), _ = self._input_point()
         wdt.click(ix, iy)
@@ -1018,10 +1104,10 @@ class WeChat:
         winman.activate_wechat()
         self._snap = None
         try:
-            img, rows, g3, scale3 = self._window_rows(activate=True, refresh=True)
+            img, g3, scale3 = self._shot(activate=True, refresh=True)
         except Exception as e:
             return WxResponse(False, f'发送中止: 微信窗口不可用 ({e})')
-        if 'search' not in self._anchors(rows, g3, img, scale3):
+        if not self._main_page_ok(img, g3, scale3):
             return WxResponse(False, '发送中止: 微信窗口不在主界面 (可能未登录或被遮挡)')
         text = '\n'.join('file://' + str(p) for p in paths)
         (ix, iy), _ = self._input_point()
@@ -1048,25 +1134,33 @@ class WeChat:
                 return []
         t = a.get('title')
         W, H = geo['w'], geo['h']
+        rect = self._selected_session_rect(img, geo, scale)
+        if not t and rect is None:
+            # 没有标题也没有选中会话 = 没有打开的聊天 (恢复后仍如此)。
+            # 此时聊天区若 OCR 出文字, 多半是悬浮其上的系统通知 toast,
+            # 读出来只会污染消息列表 → 直接返回空。
+            return []
         chat_name = self._last_chat or ''
         if t:
             near = [r for r in rows
                     if abs(r['ly'] - t['ly']) < 20
-                    and t['lx'] <= r['lx'] <= t['lx'] + t['lw'] + 60 * (W / 855)
+                    and t['lx'] <= r['lx'] <= t['lx'] + t['lw'] + 60
                     and self._tok_ok(r)]
             near.sort(key=lambda r: r['lx'])
             chat_name = _clean_name(self._join([r['text'] for r in near])) or chat_name
         if not chat_name:
             chat_name = self._title_name(a, img, geo, scale) or self._last_chat or ''
-        x0 = (t['lx'] if t else a['search']['lx'] + W * 0.27) - W * 0.015
+        # 聊天区左缘: 标题锚点 > 面板固定右缘 (面板宽不随窗口变, 旧版
+        # 0.27W 在最大化窗口会把聊天区左半截排除掉)
+        x0 = (t['lx'] - 15) if t else geo['x'] + PANEL_X1 + 6
         # 若能定位到会话面板右缘 (绿色高亮行), 用它排除会话列泄漏
         rect = self._selected_session_rect(img, geo, scale)
         if rect is not None and rect[2] < (t['lx'] if t else x0 + W):
             x0 = rect[2] + W * 0.004
         y0 = (t['ly'] + t['lh'] * 2.2) if t else a['search']['ly'] + a['search']['lh'] * 3
-        # 聊天区底界: 输入区高度近似恒定 (~150 逻辑px), 用窗口高推导可避免
-        # 把输入框草稿读成消息 (旧版固定 0.86H 在小窗口会把草稿区包进来)
-        y1 = geo['y'] + H - max(120, H * 0.115)
+        # 聊天区底界: 输入区是固定逻辑高 (实测 140), 旧版 max(120, 0.115H)
+        # 在高窗口会把输入框草稿区包进来
+        y1 = geo['y'] + H - INPUT_H
         # 自己发的气泡是「深色字+绿底」, psm3 对其系统性失读 → 单独检测 OCR
         gbs = self._green_bubbles(img, geo, scale, x0)
         chat = [r for r in rows if x0 <= r['lx'] and y0 <= r['ly'] <= y1]
@@ -1109,7 +1203,14 @@ class WeChat:
             else:
                 side = 'self' if m['lx'] > center + 8 else 'friend'
                 # 时间行 (居中小字) / “N条新消息”浮标 → 忽略
-                if re.match(r'^\d{1,2}:\d{2}$', joined) and m['lx'] + 20 > center - W * 0.08                         and m['lx'] < center + W * 0.08:
+                # 时间/日期分隔行 (居中小字): 纯时刻或带昨天/星期/日期前缀 → 忽略
+                if re.match(r'^\d{1,2}:\d{2}$', joined) and \
+                        m['lx'] + 20 > center - 120 and m['lx'] < center + 120:
+                    continue
+                if side == 'friend' and len(joined) < 22 and \
+                        re.match(r'^(昨天|前天|今天|星期[\u4e00-\u9fff]|\d{1,2}月\d{1,2}日)',
+                                 joined) and \
+                        m['lx'] + 20 > center - 160 and m['lx'] < center + 160:
                     continue
                 if '条新消息' in joined:
                     continue
@@ -1129,7 +1230,7 @@ class WeChat:
                 cur_sender = None
             is_sender_name = (side == 'friend' and m['lh'] < 16
                               and len(joined) < 24
-                              and m['lx'] < x0 + (geo['x'] + W - x0) * 0.18)
+                              and m['lx'] < x0 + 200)   # 群昵称在左缘固定窄带内
             if is_sender_name:
                 cur_sender = joined
             else:
@@ -1151,8 +1252,8 @@ class WeChat:
         winman.activate_wechat()
         self._snap = None
         time.sleep(0.2)
-        mx = geo['x'] + geo['w'] * 0.68
-        my = geo['y'] + geo['h'] * 0.4
+        mx = geo['x'] + (PANEL_X1 + geo['w']) / 2   # 聊天区中线 (面板固定宽)
+        my = geo['y'] + geo['h'] * 0.35
         wdt.mousemove(mx, my)
         time.sleep(0.2)
         for _ in range(5):
@@ -1169,31 +1270,6 @@ class WeChat:
                         '公众号、服务号', '企业微信联系人', '通讯录管理',
                         '联系人', '朋友', '网络联系人'}
 
-    def _has_avatar(self, img, geo, scale, y_center):
-        """联系人列表行在头像列 (rx 0.105~0.155) 是否有头像 (彩色/亮像素)。
-        分区头/索引字母行那里是纯色背景。"""
-        import numpy as np
-        try:
-            arr = np.asarray(img.convert('RGB'))
-        except Exception:
-            return True
-        W = geo['w']
-        x0 = int(0.105 * W * scale)
-        x1 = int(0.155 * W * scale)
-        y0 = int((y_center - geo['y'] - 14) * scale)
-        y1 = int((y_center - geo['y'] + 14) * scale)
-        reg = arr[max(0, y0):y1, max(0, x0):x1]
-        if reg.size == 0:
-            return False
-        mx = reg.max(axis=2).astype(int)
-        mn = reg.min(axis=2).astype(int)
-        colorful = int(((mx - mn) > 40).sum())
-        bright = int((reg.mean(axis=2) > 90).sum())
-        n = reg.shape[0] * reg.shape[1]
-        # 实测标定: 好友行 (含灰色默认头像) bright 占比 ≥25%, 分区头 ≤19%,
-        # 纯乱码行更低; 彩色照片头像另外用 colorful 占比兜底
-        return bool(bright > n * 0.22 or colorful > n * 0.12)
-
     @_serialized
     def GetFriendDetails(self, n=10, timeout=0, save_head_image=False,
                          save_head_wait=0):
@@ -1205,30 +1281,39 @@ class WeChat:
         self.SwitchToContact()
         time.sleep(0.8)
         img, rows, geo, scale = self._window_rows(activate=False, refresh=True)
-        W, H = geo['w'], geo['h']
-        x0 = geo['x'] + W * 0.055
-        x1 = geo['x'] + W * 0.45
+        # 联系人列表面板固定宽: 名字列 ~108..430。旧版按窗口比例
+        # (0.055W..0.45W / 0.155W 门限), 最大化窗口时会把右侧详情面板
+        # 文字读进来, 名字也会被 x 门限拦腰截断
+        x0 = geo['x'] + 60
+        x1 = geo['x'] + 430
         items = [r for r in rows
-                 if x0 <= r['lx'] <= x1 and r['ly'] > geo['y'] + H * 0.08]
+                 if x0 <= r['lx'] <= x1 and r['ly'] > geo['y'] + 90]
         lines = self._cluster_lines(items)
         out = []
         for line in lines:
             self._tick()
-            # 名字只取头像右侧的 token (头像本身会被 OCR 成乱字黏在行首)
-            nm_toks = [t for t in line if t['lx'] >= geo['x'] + W * 0.155]
+            # 分区头判定用整行文本 (头行的人数字 token 在名字门限右侧,
+            # 只看 nm 会漏掉 → 人数 '35' 之类会漏进来)
+            line_txt = self._join([t['text'] for t in line])
+            # 名字只取头像右侧的名字列 token: 列起点 ~129 (固定布局),
+            # 分区头文字在 ~95, 门限 108 挡不住 OCR 右移的乱字框 (曾漏出
+            # '人152' 之类) → 收紧到 120
+            nm_toks = [t for t in line if t['lx'] >= geo['x'] + 120]
             nm = _clean_name(self._join([t['text'] for t in nm_toks]))
             if not nm:
                 continue
             # 分区头: 行内含 > 箭头 token, 或名称含分区头字样 (头像乱字可能黏连)
             if any(t['text'].strip() in ('>', '》', '>》', '›') for t in line):
                 continue
-            if any(h in nm for h in self._CONTACT_HEADERS):
+            if any(h in line_txt for h in self._CONTACT_HEADERS):
                 continue
             if re.match(r'^[A-Za-z]$', nm):     # 分组索引字母
                 continue
-            # 真正的判据: 好友行有头像, 分区头/索引行没有
-            if not self._has_avatar(img, geo, scale, line[0]['ly']):
+            if re.match(r'^\d+$', nm):          # 分区头行右缘的人数
                 continue
+            # 注: 不再用「头像列像素」过滤 —— 分区头自带小图标、深色头像
+            # 与背景难分, 最大化/换主题下判据全崩 (曾导致整个功能返回空)。
+            # 文字过滤器已覆盖实测所有分区头/索引行。
             if nm in out:
                 continue
             out.append(nm)
@@ -1276,16 +1361,21 @@ class WeChat:
 
     @_serialized
     def SwitchToChat(self):
+        # 先激活: 后台窗口时 libei 点击会落到前台别的应用上 (实测踩坑)
+        winman.activate_wechat()
+        time.sleep(0.3)
         geo = self._cached_geo()
-        wdt.click(geo['x'] + geo['w'] * NAV_X, geo['y'] + geo['h'] * NAV_CHAT_Y)
+        wdt.click(geo['x'] + NAV_CHAT[0], geo['y'] + NAV_CHAT[1])
         time.sleep(0.4)
         self._snap = None
         return True
 
     @_serialized
     def SwitchToContact(self):
+        winman.activate_wechat()
+        time.sleep(0.3)
         geo = self._cached_geo()
-        wdt.click(geo['x'] + geo['w'] * NAV_X, geo['y'] + geo['h'] * NAV_CONTACT_Y)
+        wdt.click(geo['x'] + NAV_CONTACT[0], geo['y'] + NAV_CONTACT[1])
         time.sleep(0.5)
         self._snap = None
         return True

@@ -153,7 +153,8 @@ def window_shot(wait_activate=True, shrink=0, geo=None):
         geo = winman.get_wechat_geometry()
     if geo is None:
         raise RuntimeError('未找到微信窗口')
-    scale = winman.desktop_logical_size().get('scale', 1.0)
+    # 窗口所在屏的 scale (多屏混合 DPI 时不能用第一块屏的)
+    scale = winman.desktop_logical_size(geo).get('scale', 1.0)
     path = full_screenshot()
     im = Image.open(path)
     x, y = int(geo['x'] * scale), int(geo['y'] * scale)
