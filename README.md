@@ -23,7 +23,7 @@ MCP 客户端 (Claude / ZCode / 任意 MCP 宿主)
                   └─ wxauto_linux.WeChat   ← 本项目核心
                        ├─ winman.py  窗口几何/激活/托盘恢复: KWin Scripting D-Bus
                        ├─ wdt.py     输入注入: wdotool (libei + xdg-desktop-portal)
-                       ├─ ocr.py     读取: spectacle 截图 → 裁剪 → tesseract(chi_sim)
+                       ├─ ocr.py     读取: spectacle 截图 → 裁剪 → PP-OCRv6 (rapidocr/onnxruntime, tesseract 兜底)
                        └─ wechat.py  业务: 会话列表/切换聊天/收发消息/联系人 (OCR 锚点)
 ```
 
@@ -41,8 +41,12 @@ MCP 客户端 (Claude / ZCode / 任意 MCP 宿主)
 ## 安装与验证
 
 ```bash
-# 依赖(Manjaro/Arch): kwin spectacle tesseract tesseract-data-chi_sim wl-clipboard qdbus kscreen
-#   sudo pacman -S kwin spectacle tesseract tesseract-data-chi_sim wl-clipboard kscreen
+# 依赖(Manjaro/Arch): kwin spectacle wl-clipboard qdbus kscreen
+#   sudo pacman -S kwin spectacle wl-clipboard kscreen
+#   (tesseract 仅作兜底, 建议也装: tesseract tesseract-data-chi_sim)
+
+# OCR 引擎: PP-OCRv6 (rapidocr>=3.10, onnxruntime CPU, 首次运行自动下载模型)
+#   venv/bin/pip install rapidocr
 
 # wdotool 0.5.3 (libei 输入注入): 从 release 下载放入 wdotool-bin/
 #   https://github.com/wjatgdhx/wdotool/releases  (或自编译, 见其仓库)
@@ -66,20 +70,21 @@ MCP 客户端 (Claude / ZCode / 任意 MCP 宿主)
 # initialize → 27 tools → wechat_status / get_sessions / get_chat_info / get_messages
 ```
 
-## 已验证(2026-11-03,真实微信实例,MCP 全链路)
+## 已验证(2026-11-03,真实微信实例,MCP 全链路,PP-OCRv6 引擎)
 
 | 能力 | 实测 |
 |---|---|
 | wechat_status | 0.1s |
-| get_sessions(含选中行,绿色行条带 OCR 补齐) | 3.5s |
+| get_sessions(含选中行,绿色行条带 OCR 补齐) | 3-6s |
 | get_chat_info | 0.2s(缓存命中) |
 | switch_chat(已在目标 → 免点击直接返回) | 3.7s |
-| switch_chat(会话列表快路径 / 搜索下拉) | 7-13s |
-| send_message(带 who,切换+双验证+发送) | 6-8s |
+| switch_chat(会话列表快路径 / 搜索下拉) | 7-14s |
+| send_message(带 who,切换+双验证+发送) | 6-12s |
 | send_message(并发调用下) | 6.2s |
-| get_messages(发送后读回,含自己发的绿气泡) | 3.8s |
-| get_friends(联系人页 OCR,头像判定过滤分区头) | 5.0s |
-| 错误路径(不存在的联系人) | ~18s 安全失败+自恢复 |
+| get_messages(发送后读回,含自己发的绿气泡) | 4-10s |
+| get_history(向上翻页读取旧消息) | ~8s |
+| get_friends(联系人页 OCR,头像判定过滤分区头) | 5.1s |
+| 错误路径(不存在的联系人) | ~19s 安全失败+自恢复 |
 | 窗口被关进托盘 | 下次操作自动恢复 |
 
 ### 发送安全设计(踩坑后加固)
@@ -115,10 +120,13 @@ MCP 客户端 (Claude / ZCode / 任意 MCP 宿主)
    输入走 libei portal(token 缓存于 ~/.local/state/wdotool/)。
 3. **AT-SPI 几何是陈旧的**,只能用 KWin frameGeometry;
    截图是物理像素,逻辑坐标 × scale(1.5)换算。
-4. **tesseract psm 陷阱**:psm6 对深色 UI 上的浅色占位字(「搜索」)不稳定,
-   psm3 对深底白字气泡也可能整块失读;psm3 在「无选中聊天」状态会整块丢掉
-   窗口顶部(补救:全图 psm6 再读一遍,裁条带反而破坏版面分析);
-   自己发的消息是「深色字+绿底」,必须按绿色气泡框→文字 bbox→二值化单独 OCR。
+4. **OCR 引擎已从 tesseract 换成 PP-OCRv6**(rapidocr 3.x, onnxruntime CPU):
+   质量碾压级提升(此前会话名/标题经常读错),CPU 单帧 ~1.6s。
+   三个关键坑:① PaddleOCR 系按 OpenCV 惯例**吃 BGR**,喂 RGB 时深色 UI
+   检测会整块崩掉;② **二值化反而有害**——v6 是自然图像模型,原样裁剪最准,
+   只有极低对比的灰色占位字(「搜索」)需要灰度拉伸;③ 自己发的消息是
+   「深色字+绿底」,检测模型漏检 → 绿掩码找框+深色像素定文字 bbox+原样紧裁
+   rec-only(use_det=False)。
 5. **MCP 宿主会过滤环境变量**(只留 HOME/PATH 等):驱动内所有子进程
    统一走 `winman.session_env()`,推断补齐 XDG_RUNTIME_DIR /
    DBUS_SESSION_BUS_ADDRESS / WAYLAND_DISPLAY。

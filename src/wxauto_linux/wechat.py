@@ -57,7 +57,7 @@ RED = (237, 92, 75)
 # 单操作截止时间: MCP 宿主 (如 ZCode) 通常 30s 超时, 留余量保证错误能返回
 OP_TIMEOUT = 24.0
 # 截图/OCR 结果复用窗口 (同一次操作内的多个步骤共享一张截图)
-CACHE_TTL = 1.5
+CACHE_TTL = 4.0
 # 窗口几何复用窗口 (我们自己的操作不会移动窗口)
 GEO_TTL = 3.0
 # 操作互斥锁等待: 上一操作仍在后台执行时最多等这么久, 然后报忙
@@ -216,7 +216,7 @@ class WeChat:
         box = (int(x0f * W * scale), int(y0f * H * scale),
                int(x1f * W * scale), int(y1f * H * scale))
         crop = img.crop(box)
-        rows = ocr.ocr(crop, psm=psm)
+        rows = ocr.ocr(crop)
         for r in rows:
             r['lx'] = geo['x'] + x0f * W + r['x'] / scale
             r['ly'] = geo['y'] + y0f * H + r['y'] / scale
@@ -227,19 +227,26 @@ class WeChat:
     def _state(self, activate=True, refresh=False):
         """读一次窗口状态: (img, rows, geo, scale, anchors)。
 
-        psm3 偶发整块丢失窗口顶部 (搜索框/标题区) → 此时裁顶部条带用
-        psm6 补一次 (实测空状态截图 psm3 顶部 0 行, psm6 正常)。
+        搜索框的灰色占位字「搜索」对比度太低, 主 pass 常漏检 →
+        顶部条带灰度拉伸后再补一遍 (两遍结果合并)。
         """
         img, rows, geo, scale = self._window_rows(activate=activate, refresh=refresh)
+        W, H = geo['w'], geo['h']
+        try:
+            band = img.crop((int(0.04 * W * scale), int(0.02 * H * scale),
+                             int(0.42 * W * scale), int(0.16 * H * scale)))
+            st = ocr.stretch_gray(band)
+            ox, oy = 0.04 * W, 0.02 * H
+            extra = ocr.ocr(st)
+            for r in extra:
+                r['lx'] = geo['x'] + ox + r['x'] / scale
+                r['ly'] = geo['y'] + oy + r['y'] / scale
+                r['lw'] = r['w'] / scale
+                r['lh'] = r['h'] / scale
+            rows = rows + extra
+        except Exception:
+            pass
         a = self._anchors(rows, geo, img, scale)
-        if 'search' not in a:
-            # psm3 在「无选中聊天」状态下会整块丢掉窗口顶部 → 全图 psm6 补一次
-            # (裁条带会破坏 tesseract 版面分析, 必须全图)
-            try:
-                rows = rows + self._to_window_rows(ocr.ocr(img, psm=6), geo, scale)
-                a = self._anchors(rows, geo, img, scale)
-            except Exception:
-                pass
         return img, rows, geo, scale, a
 
     # ---- 基础 ----------------------------------------------------------
@@ -310,7 +317,19 @@ class WeChat:
                 if r['lx'] > xgate
                 and abs(r['ly'] - sy) < 25
                 and self._tok_ok(r)]
-        toks.sort(key=lambda r: r['lx'])
+        # 检测框可能重复 (同一标题被框两次: '文件传'+'文件传输助手') →
+        # 丢弃与已有框水平重叠超过一半的框
+        kept = []
+        for r in sorted(toks, key=lambda r: r['lw'], reverse=True):
+            dup = False
+            for k in kept:
+                ov = min(r['lx'] + r['lw'], k['lx'] + k['lw']) - max(r['lx'], k['lx'])
+                if ov > r['lw'] * 0.5:
+                    dup = True
+                    break
+            if not dup:
+                kept.append(r)
+        toks = sorted(kept, key=lambda r: r['lx'])
         if toks:
             name = _clean_name(self._join([t['text'] for t in toks]))
             if len(name) >= 2:
@@ -643,6 +662,7 @@ class WeChat:
             else:
                 segs.append([y, y])
         out = []
+        from PIL import Image as _I
         for y0, y1 in segs:
             if y1 - y0 < 14:                     # 图标碎片
                 continue
@@ -652,31 +672,40 @@ class WeChat:
             if len(xs) == 0 or xs.max() - xs.min() < 24:
                 continue
             x0, x1 = int(xs.min()), int(xs.max())
-            sub = gray[y0:y1 + 1, x0:x1 + 1]
-            dm = (sub < 115) & colok[x0:x1 + 1][None, :]   # 深色文字像素
-            if dm.sum() < 25:
-                continue
-            dys, dxs = np.where(dm)
-            pad = 5
-            cy0 = max(0, y0 + int(dys.min()) - pad)
-            cy1 = min(Hpx, y0 + int(dys.max()) + pad)
-            cx0 = max(0, x0 + int(dxs.min()) - pad)
-            cx1 = x0 + int(dxs.max()) + pad
-            g2 = gray[cy0:cy1, cx0:cx1]
-            bw = np.where(g2 < 115, 0, 255).astype('uint8')
-            from PIL import Image as _I
+            # 原样裁剪 (带边距) 走常规 det+rec: v6 对长气泡直接可读
+            crop = img.crop((max(0, x0 - 8), max(0, y0 - 8),
+                             min(arr.shape[1], x1 + 8), min(Hpx, y1 + 8)))
+            txt = ''
             try:
-                txt = ''.join(t['text'] for t in ocr.ocr(_I.fromarray(bw), psm=6)
-                              if t['text'].strip())
+                parts = [t['text'] for t in ocr.ocr(crop) if t['text'].strip()]
+                txt = ''.join(parts)
             except Exception:
-                continue
+                parts = []
+            if not txt:
+                # 短气泡 det 漏检 → 深色像素定文字 bbox, 原样紧裁 rec-only
+                gray = np.asarray(img.convert('L'))
+                sub = gray[y0:y1 + 1, x0:x1 + 1]
+                dm = (sub < 115) & colok[x0:x1 + 1][None, :]
+                if int(dm.sum()) < 25:
+                    continue
+                dys, dxs = np.where(dm)
+                pad = 5
+                cy0 = max(0, y0 + int(dys.min()) - pad)
+                cy1 = min(Hpx, y0 + int(dys.max()) + pad)
+                cx0 = max(0, x0 + int(dxs.min()) - pad)
+                cx1 = x0 + int(dxs.max()) + pad
+                try:
+                    rec = ocr.ocr_rec_line(img.crop((cx0, cy0, cx1, cy1)))
+                    txt = ''.join(t['text'] for t in rec if t['text'].strip())
+                except Exception:
+                    continue
             if not txt:
                 continue
-            out.append({'ly': geo['y'] + (cy0 + cy1) / 2 / scale,
-                        'ly0': geo['y'] + cy0 / scale,
-                        'ly1': geo['y'] + cy1 / scale,
-                        'lx': geo['x'] + cx0 / scale,
-                        'lxr': geo['x'] + cx1 / scale,
+            out.append({'ly': geo['y'] + (y0 + y1) / 2 / scale,
+                        'ly0': geo['y'] + y0 / scale,
+                        'ly1': geo['y'] + y1 / scale,
+                        'lx': geo['x'] + x0 / scale,
+                        'lxr': geo['x'] + x1 / scale,
                         'text': txt})
         return out
 
@@ -743,7 +772,8 @@ class WeChat:
     # 搜索下拉的分区头 (整行): 之前的行全是搜索入口, 之后的才是联系人
     SEARCH_SECTIONS = ('功能', '联系人', '聊天记录', '群聊', '朋友圈', '公众号')
     # 搜索入口/动作行的特征词 (如「文件传输助手 打开」)
-    SEARCH_ACTION_WORDS = ('打开', '已读', '恢复', '数据', '小程序', '搜索')
+    SEARCH_ACTION_WORDS = ('打开', '已读', '恢复', '数据', '小程序', '搜索',
+                           '帮助与反馈', '解除', '自助', '辅助', '验证解封')
 
     def _search_candidate(self, cand_rows, who, exact):
         """在搜索下拉行里选目标, 返回 (trust, y, (x,y)) 或 None。
@@ -758,18 +788,19 @@ class WeChat:
         for i, name in enumerate(names):
             if not name:
                 continue
-            if name in self.SEARCH_SECTIONS or name.startswith(('网络搜索', '搜索网络')):
-                # 「搜索网络结果」分区的子行点了会进全窗网页 → 整段排除
-                skip_rest = name.startswith(('网络搜索', '搜索网络'))
+            # 网络搜索分区: 头行特征是「搜索/网络 + 结果」的组合, 清洗后仍能命中;
+            # 子行带 🔍 前缀 (OCR 成 'Q'), 且都出现在头行之后 → 全部排除
+            if '网络' in name and '结果' in name:
+                skip_rest = True
                 continue
             if skip_rest:
                 continue
-            if not skip_rest:
+            if name in self.SEARCH_SECTIONS:
                 # 分区头 (功能/联系人/群聊...) 后首个匹配行 = 结构定位 (trust 0)
                 j = i + 1
                 while j < len(lines) and (not names[j]
                                           or names[j] in self.SEARCH_SECTIONS
-                                          or names[j].startswith(('网络搜索', '搜索网络'))):
+                                          or ('网络' in names[j] and '结果' in names[j])):
                     j += 1
                 if j < len(lines):
                     nm2 = names[j]
@@ -805,10 +836,7 @@ class WeChat:
         x1f = min(1.0, rx + 0.30)
         y0f = min(0.85, ry + s['lh'] / geo['h'] + 0.008)
         y1f = 0.90
-        out = []
-        for psm in psms:
-            out.extend(self._ocr_region(img, geo, scale, x0f, y0f, x1f, y1f, psm=psm))
-        return out
+        return self._ocr_region(img, geo, scale, x0f, y0f, x1f, y1f)
 
     @_serialized
     def ChatWith(self, who: str, exact: bool = True, force: bool = False,
@@ -872,7 +900,10 @@ class WeChat:
         # 3. 裁剪 OCR 下拉 (psm3+psm6 双通道); 网络搜索结果可能把联系人
         #    顶下去 → 找不到就下滚列表再找一轮
         best = None
-        for attempt in range(2):
+        prev_lines_sig = None
+        for attempt in range(3):
+            # 下拉可能尚未加载完 (网络搜索段是异步拉取的) → 首轮多等一会
+            time.sleep(1.2 if attempt == 0 else 0.3)
             img, geo, scale = self._shot(activate=False, refresh=True)
             cand = self._dropdown_rows(img, geo, scale, s)
             c = self._search_candidate(cand, who, exact)
@@ -882,9 +913,18 @@ class WeChat:
             if best is not None:
                 break
             self._tick()
-            wdt.mousemove(s['lx'] + geo['w'] * 0.12, s['ly'] + geo['h'] * 0.35)
-            wdt.run(['scroll', '--', '0', '400'])
-            time.sleep(0.7)
+            # 下拉内容与上一轮完全一致 → 不会再有新结果 (名字不存在),
+            # 不浪费时间滚动 (注: 滚动只对“联系人被顶下去”的场景有意义,
+            # 那种情况下每轮内容会不同)
+            sig = tuple(sorted((round(l[0]['ly']), self._join([t['text'] for t in l]))
+                               for l in self._cluster_lines(cand)))
+            if sig == prev_lines_sig:
+                break
+            prev_lines_sig = sig
+            if attempt >= 1:
+                wdt.mousemove(s['lx'] + geo['w'] * 0.12, s['ly'] + geo['h'] * 0.35)
+                wdt.run(['scroll', '--', '0', '400'])
+                time.sleep(0.7)
         if best is None:
             self._recover_main_page()
             return WxResponse(False,
@@ -1026,7 +1066,7 @@ class WeChat:
         y0 = (t['ly'] + t['lh'] * 2.2) if t else a['search']['ly'] + a['search']['lh'] * 3
         # 聊天区底界: 输入区高度近似恒定 (~150 逻辑px), 用窗口高推导可避免
         # 把输入框草稿读成消息 (旧版固定 0.86H 在小窗口会把草稿区包进来)
-        y1 = geo['y'] + H - max(150, H * 0.13)
+        y1 = geo['y'] + H - max(120, H * 0.115)
         # 自己发的气泡是「深色字+绿底」, psm3 对其系统性失读 → 单独检测 OCR
         gbs = self._green_bubbles(img, geo, scale, x0)
         chat = [r for r in rows if x0 <= r['lx'] and y0 <= r['ly'] <= y1]
@@ -1048,6 +1088,11 @@ class WeChat:
             merged.append({'ly': first['ly'], 'lh': first['lh'], 'lx': first['lx'],
                            'text': joined, 'green': False})
         for gb in gbs:
+            # 只过滤贴上边的残条 (向上翻时视口顶部只露出气泡下半截);
+            # 贴下边的完整气泡是真实新消息 (若被切半, 里面文字通常已残缺
+            # 到匹配不上任何可信内容, 保留无害)
+            if gb['ly0'] <= y0 + 4:
+                continue
             merged.append({'ly': gb['ly'], 'lh': 20, 'lx': gb['lx'],
                            'text': gb['text'], 'green': True})
         merged.sort(key=lambda m: m['ly'])
@@ -1057,6 +1102,8 @@ class WeChat:
         for m in merged:
             joined = m['text']
             first_ly = m['ly']
+            if not m['green'] and first_ly - y0 < 12:
+                continue        # 顶边切半的残行 (视口外只露出下半截)
             if m['green']:
                 side = 'self'
             else:
@@ -1065,6 +1112,15 @@ class WeChat:
                 if re.match(r'^\d{1,2}:\d{2}$', joined) and m['lx'] + 20 > center - W * 0.08                         and m['lx'] < center + W * 0.08:
                     continue
                 if '条新消息' in joined:
+                    continue
+                if '跳转到最新' in joined:
+                    # 滚动后的回到底部浮标: 顺手点它, 让下次读取回到最新视图
+                    try:
+                        wdt.click(m['lx'] + 60, m['ly'])
+                        time.sleep(0.5)
+                        self._snap = None
+                    except Exception:
+                        pass
                     continue
             # 行间距很大 → 新气泡, 群聊里可能是新发言人的昵称行
             new_bubble = (last_line_y is None
@@ -1099,10 +1155,11 @@ class WeChat:
         my = geo['y'] + geo['h'] * 0.4
         wdt.mousemove(mx, my)
         time.sleep(0.2)
-        for _ in range(3):
+        for _ in range(5):
             self._tick()
-            wdt.run(['scroll', '--', '0', '600'])
-            time.sleep(0.3)
+            # 负值才是向上 (翻旧消息); 正值向下, 之前写反导致永远读同一段
+            wdt.run(['scroll', '--', '0', '-600'])
+            time.sleep(0.25)
         time.sleep(0.6)
         return self.GetAllMessage()
 

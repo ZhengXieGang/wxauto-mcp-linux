@@ -1,7 +1,16 @@
-"""截图 + OCR: 从 KWin 窗口几何裁剪全屏截图, tesseract(chi_sim) 识别。"""
+"""截图 + OCR。
+
+引擎: PP-OCRv6 (rapidocr, onnxruntime CPU) 为主, tesseract chi_sim 兜底。
+关键坑:
+- PaddleOCR 系模型按 OpenCV 惯例吃 BGR —— 喂 RGB 时深色 UI 检测会整块崩掉
+- 自己消息是「深色字+绿底」, 检测模型漏检 → 绿掩码找框 + 深色像素定文字
+  bbox + 原样紧裁 + rec-only (二值化反而更差, v6 是自然图像模型)
+- 搜索框灰色占位字 (「搜索」) 对比度过低漏检 → 灰度 levels 拉伸后再 OCR
+"""
 import os
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -10,13 +19,110 @@ from . import winman
 TESSDATA = os.environ.get(
     'WXAUTO_TESSDATA', str(Path.home() / '.local/share/tessdata'))
 
+_engine = None
+_engine_lock = threading.Lock()
+
+
+def _get_engine():
+    global _engine
+    if _engine is None:
+        with _engine_lock:
+            if _engine is None:
+                from rapidocr import RapidOCR
+                # use_cls=False: 界面文字无旋转, 省掉每行的方向分类 (~30% 提速)
+                _engine = RapidOCR(params={'Global.use_cls': False})
+    return _engine
+
+
+def _to_bgr(image):
+    import numpy as np
+    a = np.asarray(image.convert('RGB'))
+    return np.ascontiguousarray(a[:, :, ::-1])
+
+
+def ocr(image, lang='chi_sim', psm=3, tsv=True) -> list[dict]:
+    """OCR 返回 [{text, x, y, w, h, conf}] (图像内坐标, conf 0-100)。
+
+    psm 参数仅为 tesseract 兼容保留 (rapidocr 忽略)。
+    """
+    try:
+        return _ocr_rapid(image)
+    except Exception:
+        if os.environ.get('WXAUTO_DISABLE_TESSERACT'):
+            raise
+        return _ocr_tesseract(image, lang, psm, tsv)
+
+
+def _ocr_rapid(image) -> list[dict]:
+    eng = _get_engine()
+    r = eng(_to_bgr(image))
+    boxes = r.boxes if r.boxes is not None else []
+    txts = r.txts if r.txts is not None else []
+    scores = r.scores if r.scores is not None else []
+    rows = []
+    for b, t, s in zip(boxes, txts, scores):
+        xs = [p[0] for p in b]
+        ys = [p[1] for p in b]
+        rows.append({'text': str(t), 'x': int(min(xs)), 'y': int(min(ys)),
+                     'w': int(max(xs) - min(xs)), 'h': int(max(ys) - min(ys)),
+                     'conf': float(s) * 100})
+    return rows
+
+
+def _ocr_tesseract(image, lang='chi_sim', psm=3, tsv=True) -> list[dict]:
+    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
+        image.save(f.name)
+        src = f.name
+    try:
+        cmd = ['tesseract', src, 'stdout', '-l', lang, '--psm', str(psm)]
+        env = {**os.environ, 'TESSDATA_PREFIX': TESSDATA}
+        if tsv:
+            cmd.append('tsv')
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
+            rows = []
+            for line in (r.stdout or '').splitlines()[1:]:
+                parts = line.split('\t')
+                if len(parts) >= 12:
+                    try:
+                        conf = float(parts[10])
+                    except ValueError:
+                        continue
+                    text = parts[11].strip()
+                    if not text:
+                        continue
+                    rows.append({'text': text, 'x': int(parts[6]), 'y': int(parts[7]),
+                                 'w': int(parts[8]), 'h': int(parts[9]), 'conf': conf})
+            return rows
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
+        return [{'text': l, 'x': 0, 'y': 0, 'w': 0, 'h': 0, 'conf': 0}
+                for l in (r.stdout or '').splitlines() if l.strip()]
+    finally:
+        os.unlink(src)
+
+
+def ocr_rec_line(image) -> list[dict]:
+    """识别模式 (跳过检测): 对已裁紧的单行文字图直接识别。
+    返回 [{text, conf}]。用于绿气泡文字 bbox (检测模型对深字绿底漏检)。"""
+    eng = _get_engine()
+    r = eng(_to_bgr(image), use_det=False, use_cls=False)
+    txts = r.txts if r.txts is not None else []
+    scores = r.scores if r.scores is not None else []
+    return [{'text': str(t), 'conf': float(s) * 100} for t, s in zip(txts, scores)]
+
+
+def stretch_gray(image, lo=35, hi=150):
+    """灰度 levels 拉伸 (暗色 UI 上的低对比占位字 → 正常对比)。"""
+    from PIL import Image
+    import numpy as np
+    a = np.asarray(image.convert('L')).astype(float)
+    return Image.fromarray(np.clip((a - lo) / max(1, hi - lo) * 255, 0, 255).astype('uint8'))
+
 
 def full_screenshot(path=None):
     path = path or tempfile.mktemp(prefix='wxshot_', suffix='.png', dir='/tmp')
     subprocess.run(['spectacle', '-b', '-n', '-o', path], timeout=25,
                    capture_output=True, env=winman.session_env())
     # spectacle 异步写盘: 等文件大小连续两次采样稳定即认为写完
-    # (旧版固定 sleep(0.9), 每张截图白等 ~0.6s)
     last = -1
     ok = False
     for _ in range(40):
@@ -64,36 +170,3 @@ def window_shot(wait_activate=True, shrink=0, geo=None):
         except Exception:
             pass
     return crop, geo, scale
-
-
-def ocr(image, lang='chi_sim', psm=3, tsv=True) -> list[dict]:
-    """OCR 返回 [{text, x, y, w, h, conf}] (图像内坐标)。psm3 (自动版面) 比 psm6
-    对深色 UI 上的浅色占位文字 (如搜索框「搜索」) 稳定得多。"""
-    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
-        image.save(f.name)
-        src = f.name
-    try:
-        cmd = ['tesseract', src, 'stdout', '-l', lang, '--psm', str(psm)]
-        env = {**os.environ, 'TESSDATA_PREFIX': TESSDATA}
-        if tsv:
-            cmd.append('tsv')
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
-            rows = []
-            for line in (r.stdout or '').splitlines()[1:]:
-                parts = line.split('\t')
-                if len(parts) >= 12:
-                    try:
-                        conf = float(parts[10])
-                    except ValueError:
-                        continue
-                    text = parts[11].strip()
-                    if not text:
-                        continue
-                    rows.append({'text': text, 'x': int(parts[6]), 'y': int(parts[7]),
-                                 'w': int(parts[8]), 'h': int(parts[9]), 'conf': conf})
-            return rows
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
-        return [{'text': l, 'x': 0, 'y': 0, 'w': 0, 'h': 0, 'conf': 0}
-                for l in (r.stdout or '').splitlines() if l.strip()]
-    finally:
-        os.unlink(src)
