@@ -452,7 +452,14 @@ class WeChatWrapper:
                     )
 
             with self._wx_lock:
-                response = self.wx.SendFiles(filepath=filepath, who=who, exact=exact)
+                # 图片走剪贴板粘贴路线 (微信输入框唯一支持的附件粘贴类型),
+                # 其余文件走「发送文件」对话框路线
+                _IMG_EXT = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'}
+                if (len(files) == 1
+                        and Path(files[0]).suffix.lower() in _IMG_EXT):
+                    response = self.wx.SendImg(filepath=files[0], who=who, exact=exact)
+                else:
+                    response = self.wx.SendFiles(filepath=filepath, who=who, exact=exact)
 
                 if hasattr(response, 'success') and not response.success:
                     return MessageResult.from_error(

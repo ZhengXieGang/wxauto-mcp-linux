@@ -32,9 +32,10 @@ MCP 客户端 (Claude / ZCode / 任意 MCP 宿主)
 sudo pacman -S kwin spectacle wl-clipboard kscreen tesseract tesseract-data-chi_sim
 
 # Python 环境 (venv): wxauto-mcp==1.0.2 mcp==1.9.1 pydantic==2.11.7
-#   psutil requests rapidocr (PP-OCRv6 引擎, 首次运行自动下载模型)
+#   psutil requests rapidocr pywayland
+#   (rapidocr=PP-OCRv6 引擎, pywayland=文件/图片剪贴板; 模型首次运行自动下载)
 python -m venv venv
-venv/bin/pip install wxauto-mcp==1.0.2 "mcp==1.9.1" pydantic==2.11.7 psutil requests rapidocr
+venv/bin/pip install wxauto-mcp==1.0.2 "mcp==1.9.1" pydantic==2.11.7 psutil requests rapidocr pywayland
 
 # wdotool 0.5.3: 从 https://github.com/wjatgdhx/wdotool/releases 下载,
 # 解压到 wdotool-bin/wdotool-x86_64-unknown-linux-gnu/wdotool
@@ -70,6 +71,9 @@ DPI scale 1.0 / 1.5 各跑一轮。
 
 - 一切读取皆 OCR:名称可能黏连或丢字(表情/生僻字名尤甚),匹配用字符集
   模糊兜底;消息读取只覆盖当前可见区域。
+- 发送图片走剪贴板粘贴;发送普通文件走「发送文件」对话框(~20s)——
+  微信 Linux 输入框的粘贴只认文本和图片,不支持文件。
+- 文件/图片气泡读取时 attr 可能误判为 friend(卡片非绿底,侧别启发式失效)。
 - 不支持:发送链接卡片、消息监听回调(用 GetNextNewMessage 轮询替代)、
   好友详细信息(仅昵称列表)。
 - 切换不在可视会话列表中的联系人走搜索路径,耗时 ~15-25s,保证安全返回。

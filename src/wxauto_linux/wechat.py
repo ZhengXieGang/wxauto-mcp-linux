@@ -15,7 +15,9 @@
 - 标题锚点按词块聚合 (psm3 常把标题拆成单字), 各处名称出口统一清洗
   OCR 幻觉引号/标点。
 """
+import os
 import re
+import sys
 import threading
 import time
 from functools import wraps
@@ -1087,8 +1089,40 @@ class WeChat:
         self._snap = None
         return WxResponse(True, '发送成功')
 
+    _DLG_GEO_JS = (
+        'const w = (() => { for (const x of workspace.windowList()) '
+        'if (x.caption.indexOf("选择文件") >= 0) return x; })();'
+        'if (w) { const g = w.frameGeometry; '
+        'console.info("WXDLG|" + Math.round(g.x) + "|" + Math.round(g.y) + "|" '
+        '+ Math.round(g.width) + "|" + Math.round(g.height)); '
+        '} else { console.info("WXDLG|none"); }'
+    )
+
+    def _file_dialog_geo(self):
+        """「选择文件」对话框的屏幕逻辑几何; 无对话框返回 None。"""
+        out = winman.kwin_run_js(self._DLG_GEO_JS, 'WXDLG', wait=0.4)
+        if not out or out == 'none':
+            return None
+        p = out.split('|')
+        if len(p) < 4:
+            return None
+        return {'x': float(p[0]), 'y': float(p[1]),
+                'w': float(p[2]), 'h': float(p[3])}
+
+    # 「发送文件」按钮: 输入工具栏第 3 个图标, 固定逻辑坐标
+    # (面板右缘 300 起的表情/收藏之后), 距窗口底 ~31
+    FILE_BTN_OFF = (300 + 104, -31)
+    # 对话框底部「名称(N)」输入框, 相对对话框几何的固定位置
+    DLG_NAME_FIELD = (0.62, 0.82)
+
     @_serialized
     def SendFiles(self, filepath, who=None, exact=False, max_retries=3) -> WxResponse:
+        """发送文件: 「发送文件」按钮 → 系统文件对话框 → 名称栏粘贴路径。
+
+        微信 Linux 输入框不支持文件粘贴 (uri-list 只会被当纯文本),
+        唯一可靠通道是文件对话框。附件挂上后 OCR 校验输入区确实出现
+        文件卡片, 没有就不按回车 (防止误发草稿)。
+        """
         if who:
             r = self.ChatWith(who, exact=exact)
             if not r.success:
@@ -1096,7 +1130,7 @@ class WeChat:
             guard = self._verify_target(who)
             if guard is not None:
                 return guard
-        paths = filepath if isinstance(filepath, list) else [filepath]
+        paths = [str(p) for p in (filepath if isinstance(filepath, list) else [filepath])]
         for p in paths:
             if not Path(p).exists():
                 return WxResponse(False, f'文件不存在: {p}')
@@ -1109,17 +1143,113 @@ class WeChat:
             return WxResponse(False, f'发送中止: 微信窗口不可用 ({e})')
         if not self._main_page_ok(img, g3, scale3):
             return WxResponse(False, '发送中止: 微信窗口不在主界面 (可能未登录或被遮挡)')
-        text = '\n'.join('file://' + str(p) for p in paths)
-        (ix, iy), _ = self._input_point()
-        wdt.click(ix, iy)
-        time.sleep(0.4)
-        self._clipboard(text)
-        wdt.key_ctrl_v()
-        time.sleep(1.2)
+        geo = self._cached_geo()
+        # 输入框清空 (clear=True 语义; 也防止回车误发残留草稿)
+        wdt.click(geo['x'] + geo['w'] * 0.55, geo['y'] + geo['h'] - 60)
+        time.sleep(0.3)
+        wdt.key_ctrl_a()
+        time.sleep(0.15)
+        wdt.key_delete()
+        time.sleep(0.3)
+        attached = 0
+        for path in paths:
+            self._tick()
+            # 1. 点「发送文件」按钮
+            wdt.click(geo['x'] + self.FILE_BTN_OFF[0], geo['y'] + geo['h'] + self.FILE_BTN_OFF[1])
+            time.sleep(1.6)
+            # 2. KWin 定位对话框
+            dlg = None
+            for _ in range(3):
+                dlg = self._file_dialog_geo()
+                if dlg is not None:
+                    break
+                time.sleep(0.8)
+            if dlg is None:
+                break
+            # 3. 名称(N) 栏粘贴绝对路径 (打字会触发补全弹层劫持回车)
+            wdt.click(dlg['x'] + dlg['w'] * self.DLG_NAME_FIELD[0],
+                      dlg['y'] + dlg['h'] * self.DLG_NAME_FIELD[1])
+            time.sleep(0.5)
+            wdt.key_ctrl_a()
+            time.sleep(0.15)
+            self._clipboard(path)
+            wdt.key_ctrl_v()
+            time.sleep(0.6)
+            wdt.key_enter()
+            time.sleep(1.4)
+            attached += 1
+        if attached == 0:
+            return WxResponse(False, '发送中止: 文件对话框未打开或未挂上附件')
+        # 4. 校验输入区确实出现了附件卡片 (OCR 找文件名), 没有就不发送
+        img2, g4, sc4 = self._shot(activate=False, refresh=True)
+        inp_rows = self._ocr_region(img2, g4, sc4, 0.28,
+                                    max(0.0, (g4['h'] - 145) / g4['h']), 0.9, 0.98)
+        inp_text = ''.join(r['text'] for r in inp_rows)
+        basenames = [Path(p).name for p in paths[:attached]]
+        hit = [b for b in basenames
+               if any(ch in inp_text for ch in {b[:8], b[-8:]} if ch)]
+        if not hit:
+            return WxResponse(False,
+                              '发送中止: 附件未出现在输入区 (对话框流程失败), '
+                              '未回车发送; 输入区已保留现场可人工检查')
+        # 5. 回车发送
+        wdt.click(geo['x'] + geo['w'] * 0.55, geo['y'] + geo['h'] - 60)
+        time.sleep(0.3)
         wdt.key_enter()
         time.sleep(1.0)
         self._snap = None
-        return WxResponse(True, f'发送 {len(paths)} 个文件')
+        return WxResponse(True, f'发送 {attached} 个文件')
+
+    @_serialized
+    def SendImg(self, filepath, who=None, exact=False) -> WxResponse:
+        """发送图片: 多 MIME 剪贴板 (image/png 等) → 输入框粘贴。
+
+        图片是输入框粘贴处理器唯一支持的附件类型 (文件不行, 见 SendFiles);
+        粘贴后校验输入区确实出现内容再回车。
+        """
+        if who:
+            r = self.ChatWith(who, exact=exact)
+            if not r.success:
+                return r
+            guard = self._verify_target(who)
+            if guard is not None:
+                return guard
+        path = str(filepath if not isinstance(filepath, list) else filepath[0])
+        if not Path(path).exists():
+            return WxResponse(False, f'图片不存在: {path}')
+        self._tick()
+        winman.activate_wechat()
+        self._snap = None
+        try:
+            img, g3, scale3 = self._shot(activate=True, refresh=True)
+        except Exception as e:
+            return WxResponse(False, f'发送中止: 微信窗口不可用 ({e})')
+        if not self._main_page_ok(img, g3, scale3):
+            return WxResponse(False, '发送中止: 微信窗口不在主界面 (可能未登录或被遮挡)')
+        geo = self._cached_geo()
+        wdt.click(geo['x'] + geo['w'] * 0.55, geo['y'] + geo['h'] - 60)
+        time.sleep(0.3)
+        wdt.key_ctrl_a()
+        time.sleep(0.15)
+        wdt.key_delete()
+        time.sleep(0.3)
+        # 空输入框基线 → 挂剪贴板 → 粘贴 → 像素差校验
+        base_img, _, _ = self._shot(activate=False, refresh=True)
+        clip_proc = self._clip_file(path)
+        try:
+            wdt.key_ctrl_v()
+            time.sleep(1.6)
+            img2, g4, sc4 = self._shot(activate=False, refresh=True)
+            if not self._input_nonempty(img2, g4, sc4):
+                return WxResponse(False, '发送中止: 图片未进入输入框 (粘贴无效果), 未回车')
+        finally:
+            clip_proc.terminate()
+        wdt.click(geo['x'] + geo['w'] * 0.55, geo['y'] + geo['h'] - 60)
+        time.sleep(0.3)
+        wdt.key_enter()
+        time.sleep(1.0)
+        self._snap = None
+        return WxResponse(True, '发送图片成功')
 
     # ---- 消息读取 -------------------------------------------------------
     @_serialized
@@ -1389,6 +1519,56 @@ class WeChat:
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(0.15)
         return p
+
+    def _clip_file(self, path: str, live=12.0):
+        """把图片挂上多 MIME 剪贴板 (子进程存活 live 秒供微信读取)。
+
+        用 sys.executable 同一解释器 (pywayland 装在 venv 里)。
+        阻塞直到子进程报 READY (selection 已挂上) 或超时报错 —— 否则
+        ctrl+v 粘到的是上一个剪贴板残留, 会把垃圾当图片发出去。
+        """
+        import subprocess
+        src_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        env = winman.session_env()
+        env['PYTHONPATH'] = src_dir + os.pathsep + env.get('PYTHONPATH', '')
+        env['CLIP_LIVE'] = str(live)
+        mod = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'clip.py')
+        p = subprocess.Popen([sys.executable, mod, path], env=env,
+                             stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             text=True)
+        deadline = time.time() + 6
+        ready = False
+        while time.time() < deadline:
+            line = p.stdout.readline().strip()
+            if line == 'READY':
+                ready = True
+                break
+            if p.poll() is not None:
+                break
+        if not ready:
+            p.terminate()
+            raise RuntimeError('剪贴板子进程未就绪 (pywayland/ext-data-control 不可用?)')
+        return p
+
+    @staticmethod
+    def _input_nonempty(img, geo, scale):
+        """输入区是否有内容 (图片卡片/文件卡片都会让像素明显偏离空背景)。"""
+        import numpy as np
+        try:
+            arr = np.asarray(img.convert('RGB'))
+        except Exception:
+            return False
+        Hpx, Wpx = arr.shape[:2]
+        # 只看输入框文字区 (贴底 135..55): 再往下是常驻工具栏图标, 必然非空
+        y0 = max(0, Hpx - int(135 * scale))
+        y1 = max(0, Hpx - int(55 * scale))
+        reg = arr[y0:y1, int(Wpx * 0.28):int(Wpx * 0.95)]
+        if reg.size == 0:
+            return False
+        med = np.median(reg.reshape(-1, 3), axis=0)
+        diff = np.abs(reg.astype(int) - med).sum(axis=2)
+        return bool((diff > 60).sum() > 500)
 
 
 class Message:

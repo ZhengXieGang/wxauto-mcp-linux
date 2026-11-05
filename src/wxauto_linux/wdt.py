@@ -74,5 +74,9 @@ def key_ctrl_a():
     return key('ctrl+a')
 
 
+def key_ctrl_l():
+    return key('ctrl+l')
+
+
 def key_ctrl_v():
     return key('ctrl+v')
